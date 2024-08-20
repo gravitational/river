@@ -496,7 +496,10 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			AdvisoryLockPrefix: config.AdvisoryLockPrefix,
 		}),
 	}
-	client.queues = &QueueBundle{addProducer: client.addProducer}
+	client.queues = &QueueBundle{
+		addProducer:    client.addProducer,
+		removeProducer: client.removeProducer,
+	}
 
 	baseservice.Init(archetype, &client.baseService)
 	client.baseService.Name = "Client" // Have to correct the name because base service isn't embedded like it usually is
@@ -1571,6 +1574,17 @@ func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) *pr
 	return producer
 }
 
+func (c *Client[TTx]) removeProducer(queueName string) {
+	producer, ok := c.producersByQueueName[queueName]
+	if !ok {
+		return
+	}
+
+	producer.Stop()
+
+	delete(c.producersByQueueName, queueName)
+}
+
 var nameRegex = regexp.MustCompile(`^(?:[a-z0-9])+(?:[_|\-]?[a-z0-9]+)*$`)
 
 func validateQueueName(queueName string) error {
@@ -1856,6 +1870,8 @@ type QueueBundle struct {
 	// Function that adds a producer to the associated client.
 	addProducer func(queueName string, queueConfig QueueConfig) *producer
 
+	removeProducer func(queueName string)
+
 	fetchCtx context.Context //nolint:containedctx
 
 	// Mutex that's acquired when client is starting and stopping and when a
@@ -1885,6 +1901,15 @@ func (b *QueueBundle) Add(queueName string, queueConfig QueueConfig) error {
 			return err
 		}
 	}
+
+	return nil
+}
+
+func (b *QueueBundle) Remove(queueName string) error {
+	b.startStopMu.Lock()
+	defer b.startStopMu.Unlock()
+
+	b.removeProducer(queueName)
 
 	return nil
 }

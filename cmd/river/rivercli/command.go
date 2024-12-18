@@ -2,7 +2,6 @@ package rivercli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +16,11 @@ import (
 	"github.com/riverqueue/river/rivermigrate"
 )
 
+const (
+	uriScheme      = "postgresql://"
+	uriSchemeAlias = "postgres://"
+)
+
 // BenchmarkerInterface is an interface to a Benchmarker. Its reason for
 // existence is to wrap a benchmarker to strip it of its generic parameter,
 // letting us pass it around without having to know the transaction type.
@@ -29,6 +33,7 @@ type BenchmarkerInterface interface {
 // around without having to know the transaction type.
 type MigratorInterface interface {
 	AllVersions() []rivermigrate.Migration
+	ExistingVersions(ctx context.Context) ([]rivermigrate.Migration, error)
 	GetVersion(version int) (rivermigrate.Migration, error)
 	Migrate(ctx context.Context, direction rivermigrate.Direction, opts *rivermigrate.MigrateOpts) (*rivermigrate.MigrateResult, error)
 	Validate(ctx context.Context) (*rivermigrate.ValidateResult, error)
@@ -39,6 +44,7 @@ type MigratorInterface interface {
 // CommandBase.
 type Command[TOpts CommandOpts] interface {
 	Run(ctx context.Context, opts TOpts) (bool, error)
+	GetCommandBase() *CommandBase
 	SetCommandBase(b *CommandBase)
 }
 
@@ -50,12 +56,11 @@ type CommandBase struct {
 	Out            io.Writer
 
 	GetBenchmarker func() BenchmarkerInterface
-	GetMigrator    func(config *rivermigrate.Config) MigratorInterface
+	GetMigrator    func(config *rivermigrate.Config) (MigratorInterface, error)
 }
 
-func (b *CommandBase) SetCommandBase(base *CommandBase) {
-	*b = *base
-}
+func (b *CommandBase) GetCommandBase() *CommandBase     { return b }
+func (b *CommandBase) SetCommandBase(base *CommandBase) { *b = *base }
 
 // CommandOpts are options for a command options. It makes sure that options
 // provide a way of validating themselves.
@@ -68,6 +73,7 @@ type RunCommandBundle struct {
 	DatabaseURL    *string
 	DriverProcurer DriverProcurer
 	Logger         *slog.Logger
+	OutStd         io.Writer
 }
 
 // RunCommand bootstraps and runs a River CLI subcommand.
@@ -80,7 +86,7 @@ func RunCommand[TOpts CommandOpts](ctx context.Context, bundle *RunCommandBundle
 		commandBase := &CommandBase{
 			DriverProcurer: bundle.DriverProcurer,
 			Logger:         bundle.Logger,
-			Out:            os.Stdout,
+			Out:            bundle.OutStd,
 		}
 
 		switch {
@@ -88,9 +94,10 @@ func RunCommand[TOpts CommandOpts](ctx context.Context, bundle *RunCommandBundle
 		// command doesn't take one.
 		case bundle.DatabaseURL == nil:
 			commandBase.GetBenchmarker = func() BenchmarkerInterface { panic("databaseURL was not set") }
-			commandBase.GetMigrator = func(config *rivermigrate.Config) MigratorInterface { panic("databaseURL was not set") }
+			commandBase.GetMigrator = func(config *rivermigrate.Config) (MigratorInterface, error) { panic("databaseURL was not set") }
 
-		case strings.HasPrefix(*bundle.DatabaseURL, "postgres://"):
+		case strings.HasPrefix(*bundle.DatabaseURL, uriScheme) ||
+			strings.HasPrefix(*bundle.DatabaseURL, uriSchemeAlias):
 			dbPool, err := openPgxV5DBPool(ctx, *bundle.DatabaseURL)
 			if err != nil {
 				return false, err
@@ -100,10 +107,15 @@ func RunCommand[TOpts CommandOpts](ctx context.Context, bundle *RunCommandBundle
 			driver := bundle.DriverProcurer.ProcurePgxV5(dbPool)
 
 			commandBase.GetBenchmarker = func() BenchmarkerInterface { return riverbench.NewBenchmarker(driver, commandBase.Logger) }
-			commandBase.GetMigrator = func(config *rivermigrate.Config) MigratorInterface { return rivermigrate.New(driver, config) }
+			commandBase.GetMigrator = func(config *rivermigrate.Config) (MigratorInterface, error) { return rivermigrate.New(driver, config) }
 
 		default:
-			return false, errors.New("unsupport database URL; try one with a prefix of `postgres://...`")
+			return false, fmt.Errorf(
+				"unsupported database URL (`%s`); try one with a `%s` or `%s` scheme/prefix",
+				*bundle.DatabaseURL,
+				uriSchemeAlias,
+				uriScheme,
+			)
 		}
 
 		command.SetCommandBase(commandBase)

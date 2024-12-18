@@ -84,7 +84,7 @@ followed by "create".
 	ctx := context.Background()
 
 	if err := commandBundle.Exec(ctx, os.Args); err != nil {
-		fmt.Fprintf(os.Stderr, "failed: "+err.Error()+"\n")
+		fmt.Fprintf(os.Stderr, "failed: %s\n", err)
 		os.Exit(1)
 	}
 }
@@ -126,7 +126,11 @@ func createTestDatabases(ctx context.Context, out io.Writer) error {
 		}
 		defer dbPool.Close()
 
-		migrator := rivermigrate.New(riverpgxv5.New(dbPool), nil)
+		migrator, err := rivermigrate.New(riverpgxv5.New(dbPool), nil)
+		if err != nil {
+			return err
+		}
+
 		if _, err = migrator.Migrate(ctx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{}); err != nil {
 			return err
 		}
@@ -311,7 +315,7 @@ func (b *CommandBundle) Exec(ctx context.Context, args []string) error {
 	}
 
 	if commandUse == "" || commandUse == helpUse && len(args) < 1 {
-		fmt.Fprintf(b.out, b.printUsage(&flagSet)+"\n")
+		fmt.Fprintf(b.out, "%s\n", b.usage(&flagSet))
 		return nil
 	}
 
@@ -326,14 +330,14 @@ func (b *CommandBundle) Exec(ctx context.Context, args []string) error {
 	}
 
 	if help {
-		fmt.Fprintf(b.out, command.printUsage(b.use, &flagSet)+"\n")
+		fmt.Fprintf(b.out, "%s\n", command.printUsage(b.use, &flagSet))
 		return nil
 	}
 
 	return command.execFunc(ctx, b.out)
 }
 
-func (b *CommandBundle) printUsage(flagSet *flag.FlagSet) string {
+func (b *CommandBundle) usage(flagSet *flag.FlagSet) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf(`

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
@@ -33,7 +34,7 @@ type testingT interface {
 // Options for RequireInserted functions including expectations for various
 // queuing properties that stem from InsertOpts.
 //
-// Multiple properties set on this struct increase the specifity on a job to
+// Multiple properties set on this struct increase the specificity on a job to
 // match, acting like an AND condition on each.
 //
 // In the case of RequireInserted or RequireInsertedMany, if multiple properties
@@ -187,7 +188,7 @@ func requireInsertedErr[TDriver riverdriver.Driver[TTx], TTx any, TArgs river.Jo
 // A RequireInsertedOpts struct can be provided as the last argument, and if it
 // is, its properties (e.g. max attempts, priority, queue name) will act as
 // requirements on a found row. If any fields are set, then the test will fail
-// if a job is found that maches all of them. If any property doesn't match a
+// if a job is found that matches all of them. If any property doesn't match a
 // found row, the row isn't considered a match, and the assertion doesn't fail.
 //
 // If more rows than one were found, the assertion fails if any of them match
@@ -205,9 +206,8 @@ func requireNotInserted[TDriver riverdriver.Driver[TTx], TTx any, TArgs river.Jo
 	}
 }
 
-// RequireInsertedTx is a test helper that verifies that a job of the given kind
-// was inserted for work, failing the test if it wasn't. If found, the inserted
-// job is returned so that further assertions can be made against it.
+// RequireNotInsertedTx is a test helper that verifies that a job of the given
+// kind was not inserted for work, failing the test if one was.
 //
 //	job := RequireInsertedTx[*riverpgxv5.Driver](ctx, t, tx, &Job1Args{}, nil)
 //
@@ -217,7 +217,7 @@ func requireNotInserted[TDriver riverdriver.Driver[TTx], TTx any, TArgs river.Jo
 // A RequireInsertedOpts struct can be provided as the last argument, and if it
 // is, its properties (e.g. max attempts, priority, queue name) will act as
 // requirements on a found row. If any fields are set, then the test will fail
-// if a job is found that maches all of them. If any property doesn't match a
+// if a job is found that matches all of them. If any property doesn't match a
 // found row, the row isn't considered a match, and the assertion doesn't fail.
 //
 // If more rows than one were found, the assertion fails if any of them match
@@ -535,4 +535,13 @@ func failure(t testingT, format string, a ...any) {
 // and footer common to all failure messages.
 func failureString(format string, a ...any) string {
 	return "\n    River assertion failure:\n    " + fmt.Sprintf(format, a...) + "\n"
+}
+
+// WorkContext returns a realistic context that can be used to test JobArgs.Work
+// implementations.
+//
+// In particular, adds a client to the context so that river.ClientFromContext is
+// usable in the test suite.
+func WorkContext[TTx any](ctx context.Context, client *river.Client[TTx]) context.Context {
+	return context.WithValue(ctx, rivercommon.ContextKeyClient{}, client)
 }

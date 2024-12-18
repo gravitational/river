@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
+	"github.com/riverqueue/river/rivershared/testsignal"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 )
@@ -20,11 +22,12 @@ const (
 	CompletedJobRetentionPeriodDefault = 24 * time.Hour
 	DiscardedJobRetentionPeriodDefault = 7 * 24 * time.Hour
 	JobCleanerIntervalDefault          = 30 * time.Second
+	JobCleanerTimeoutDefault           = 30 * time.Second
 )
 
 // Test-only properties.
 type JobCleanerTestSignals struct {
-	DeletedBatch rivercommon.TestSignal[struct{}] // notifies when runOnce finishes a pass
+	DeletedBatch testsignal.TestSignal[struct{}] // notifies when runOnce finishes a pass
 }
 
 func (ts *JobCleanerTestSignals) Init() {
@@ -46,6 +49,9 @@ type JobCleanerConfig struct {
 
 	// Interval is the amount of time to wait between runs of the cleaner.
 	Interval time.Duration
+
+	// Timeout of the individual queries in the job cleaner.
+	Timeout time.Duration
 }
 
 func (c *JobCleanerConfig) mustValidate() *JobCleanerConfig {
@@ -60,6 +66,9 @@ func (c *JobCleanerConfig) mustValidate() *JobCleanerConfig {
 	}
 	if c.Interval <= 0 {
 		panic("JobCleanerConfig.Interval must be above zero")
+	}
+	if c.Timeout <= 0 {
+		panic("JobCleanerConfig.Timeout must be above zero")
 	}
 
 	return c
@@ -86,6 +95,7 @@ func NewJobCleaner(archetype *baseservice.Archetype, config *JobCleanerConfig, e
 			CompletedJobRetentionPeriod: valutil.ValOrDefault(config.CompletedJobRetentionPeriod, CompletedJobRetentionPeriodDefault),
 			DiscardedJobRetentionPeriod: valutil.ValOrDefault(config.DiscardedJobRetentionPeriod, DiscardedJobRetentionPeriodDefault),
 			Interval:                    valutil.ValOrDefault(config.Interval, JobCleanerIntervalDefault),
+			Timeout:                     valutil.ValOrDefault(config.Timeout, JobCleanerTimeoutDefault),
 		}).mustValidate(),
 
 		batchSize: BatchSizeDefault,
@@ -145,7 +155,7 @@ func (s *JobCleaner) runOnce(ctx context.Context) (*jobCleanerRunOnceResult, err
 	for {
 		// Wrapped in a function so that defers run as expected.
 		numDeleted, err := func() (int, error) {
-			ctx, cancelFunc := context.WithTimeout(ctx, 30*time.Second)
+			ctx, cancelFunc := context.WithTimeout(ctx, s.Config.Timeout)
 			defer cancelFunc()
 
 			numDeleted, err := s.exec.JobDeleteBefore(ctx, &riverdriver.JobDeleteBeforeParams{
@@ -176,7 +186,7 @@ func (s *JobCleaner) runOnce(ctx context.Context) (*jobCleanerRunOnceResult, err
 			slog.Int("num_jobs_deleted", numDeleted),
 		)
 
-		s.CancellableSleepRandomBetween(ctx, BatchBackoffMin, BatchBackoffMax)
+		serviceutil.CancellableSleep(ctx, randutil.DurationBetween(BatchBackoffMin, BatchBackoffMax))
 	}
 
 	return res, nil

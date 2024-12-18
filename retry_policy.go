@@ -2,11 +2,9 @@ package river
 
 import (
 	"math"
-	"math/rand"
-	"sync"
+	"math/rand/v2"
 	"time"
 
-	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -29,8 +27,6 @@ type ClientRetryPolicy interface {
 
 // River's default retry policy.
 type DefaultClientRetryPolicy struct {
-	rand        *rand.Rand
-	randMu      sync.RWMutex
 	timeNowFunc func() time.Time
 }
 
@@ -47,7 +43,7 @@ type DefaultClientRetryPolicy struct {
 func (p *DefaultClientRetryPolicy) NextRetry(job *rivertype.JobRow) time.Time {
 	// For the purposes of calculating the backoff, we can look solely at the
 	// number of errors. If we were to use the raw attempt count, this would be
-	// incemented and influenced by snoozes. However the use case for snoozing is
+	// incremented and influenced by snoozes. However the use case for snoozing is
 	// to try again later *without* counting as an error.
 	//
 	// Note that we explicitly add 1 here, because the error hasn't been appended
@@ -64,39 +60,12 @@ func (p *DefaultClientRetryPolicy) timeNowUTC() time.Time {
 	return time.Now().UTC()
 }
 
-// Lazily marshals a random source. Written this way instead of using a
-// constructor so that DefaultRetryPolicy can easily be embedded in other
-// structs without special initialization.
-func (p *DefaultClientRetryPolicy) lazilyMarshalRand() {
-	{
-		p.randMu.RLock()
-		pRand := p.rand
-		p.randMu.RUnlock()
-
-		if pRand != nil {
-			return
-		}
-	}
-
-	p.randMu.Lock()
-	defer p.randMu.Unlock()
-
-	// One additional nil check in case multiple goroutines raced to this point.
-	if p.rand != nil {
-		return
-	}
-
-	p.rand = randutil.NewCryptoSeededConcurrentSafeRand()
-}
-
 // Gets a number of retry seconds for the given attempt, random jitter included.
 func (p *DefaultClientRetryPolicy) retrySeconds(attempt int) float64 {
-	p.lazilyMarshalRand()
-
 	retrySeconds := p.retrySecondsWithoutJitter(attempt)
 
 	// Jitter number of seconds +/- 10%.
-	retrySeconds += retrySeconds * (p.rand.Float64()*0.2 - 0.1)
+	retrySeconds += retrySeconds * (rand.Float64()*0.2 - 0.1)
 
 	return retrySeconds
 }

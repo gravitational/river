@@ -1,7 +1,7 @@
 module github.com/riverqueue/river/riverdriver
 
-go 1.21.4
+go 1.22
 
-replace github.com/riverqueue/river/rivertype => ../rivertype
+toolchain go1.23.0
 
-require github.com/riverqueue/river/rivertype v0.11.1
+require github.com/riverqueue/river/rivertype v0.14.3

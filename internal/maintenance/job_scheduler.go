@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
+	"github.com/riverqueue/river/rivershared/testsignal"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
+	"github.com/riverqueue/river/rivertype"
 )
 
 const (
@@ -22,14 +25,16 @@ const (
 
 // Test-only properties.
 type JobSchedulerTestSignals struct {
-	NotifiedQueues rivercommon.TestSignal[[]string] // notifies when queues are sent an insert notification
-	ScheduledBatch rivercommon.TestSignal[struct{}] // notifies when runOnce finishes a pass
+	NotifiedQueues testsignal.TestSignal[[]string] // notifies when queues are sent an insert notification
+	ScheduledBatch testsignal.TestSignal[struct{}] // notifies when runOnce finishes a pass
 }
 
 func (ts *JobSchedulerTestSignals) Init() {
 	ts.NotifiedQueues.Init()
 	ts.ScheduledBatch.Init()
 }
+
+type InsertFunc func(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error)
 
 // NotifyInsert is a function to call to emit notifications for queues where
 // jobs were scheduled.
@@ -149,7 +154,7 @@ func (s *JobScheduler) runOnce(ctx context.Context) (*schedulerRunOnceResult, er
 			now := s.Time.NowUTC()
 			nowWithLookAhead := now.Add(s.config.Interval)
 
-			scheduledJobs, err := tx.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+			scheduledJobResults, err := tx.JobSchedule(ctx, &riverdriver.JobScheduleParams{
 				Max: s.config.Limit,
 				Now: nowWithLookAhead,
 			})
@@ -157,7 +162,7 @@ func (s *JobScheduler) runOnce(ctx context.Context) (*schedulerRunOnceResult, er
 				return 0, fmt.Errorf("error scheduling jobs: %w", err)
 			}
 
-			queues := make([]string, 0, len(scheduledJobs))
+			queues := make([]string, 0, len(scheduledJobResults))
 
 			// Notify about scheduled jobs with a scheduled_at in the past, or just
 			// slightly in the future (this loop, the notify, and tx commit will take
@@ -165,12 +170,12 @@ func (s *JobScheduler) runOnce(ctx context.Context) (*schedulerRunOnceResult, er
 			// is to roughly try to guess when the clients will attempt to fetch jobs.
 			notificationHorizon := s.Time.NowUTC().Add(5 * time.Millisecond)
 
-			for _, job := range scheduledJobs {
-				if job.ScheduledAt.After(notificationHorizon) {
+			for _, result := range scheduledJobResults {
+				if result.Job.ScheduledAt.After(notificationHorizon) {
 					continue
 				}
 
-				queues = append(queues, job.Queue)
+				queues = append(queues, result.Job.Queue)
 			}
 
 			if len(queues) > 0 {
@@ -180,7 +185,7 @@ func (s *JobScheduler) runOnce(ctx context.Context) (*schedulerRunOnceResult, er
 				s.TestSignals.NotifiedQueues.Signal(queues)
 			}
 
-			return len(scheduledJobs), tx.Commit(ctx)
+			return len(scheduledJobResults), tx.Commit(ctx)
 		}()
 		if err != nil {
 			return nil, err
@@ -194,7 +199,7 @@ func (s *JobScheduler) runOnce(ctx context.Context) (*schedulerRunOnceResult, er
 			break
 		}
 
-		s.CancellableSleepRandomBetween(ctx, BatchBackoffMin, BatchBackoffMax)
+		serviceutil.CancellableSleep(ctx, randutil.DurationBetween(BatchBackoffMin, BatchBackoffMax))
 	}
 
 	return res, nil

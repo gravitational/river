@@ -2,7 +2,6 @@ package maintenance
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -19,8 +18,13 @@ import (
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/startstoptest"
 	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
 )
+
+type noOpArgs struct{}
+
+func (noOpArgs) Kind() string { return "no_op" }
 
 func TestPeriodicJobEnqueuer(t *testing.T) {
 	t.Parallel()
@@ -33,20 +37,36 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		waitChan             chan (struct{})
 	}
 
-	jobConstructorWithQueueFunc := func(name string, unique bool, queue string) func() (*riverdriver.JobInsertFastParams, *dbunique.UniqueOpts, error) {
-		return func() (*riverdriver.JobInsertFastParams, *dbunique.UniqueOpts, error) {
-			return &riverdriver.JobInsertFastParams{
+	stubSvc := &riversharedtest.TimeStub{}
+	stubSvc.StubNowUTC(time.Now().UTC())
+
+	jobConstructorWithQueueFunc := func(name string, unique bool, queue string) func() (*rivertype.JobInsertParams, error) {
+		return func() (*rivertype.JobInsertParams, error) {
+			params := &rivertype.JobInsertParams{
+				Args:        noOpArgs{},
 				EncodedArgs: []byte("{}"),
 				Kind:        name,
 				MaxAttempts: rivercommon.MaxAttemptsDefault,
 				Priority:    rivercommon.PriorityDefault,
 				Queue:       queue,
 				State:       rivertype.JobStateAvailable,
-			}, &dbunique.UniqueOpts{ByArgs: unique}, nil
+			}
+			if unique {
+				uniqueOpts := &dbunique.UniqueOpts{ByArgs: true}
+				var err error
+				params.UniqueKey, err = dbunique.UniqueKey(stubSvc, uniqueOpts, params)
+				if err != nil {
+					return nil, err
+				}
+
+				params.UniqueStates = uniqueOpts.StateBitmask()
+			}
+
+			return params, nil
 		}
 	}
 
-	jobConstructorFunc := func(name string, unique bool) func() (*riverdriver.JobInsertFastParams, *dbunique.UniqueOpts, error) {
+	jobConstructorFunc := func(name string, unique bool) func() (*rivertype.JobInsertParams, error) {
 		return jobConstructorWithQueueFunc(name, unique, rivercommon.QueueDefault)
 	}
 
@@ -54,6 +74,23 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		return func(t time.Time) time.Time {
 			return t.Add(d)
 		}
+	}
+
+	// A simplified version of `Client.insertMany` that only inserts jobs directly
+	// via the driver instead of using the pilot.
+	insertFunc := func(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
+		finalInsertParams := sliceutil.Map(insertParams, func(params *rivertype.JobInsertParams) *riverdriver.JobInsertFastParams {
+			return (*riverdriver.JobInsertFastParams)(params)
+		})
+		results, err := tx.JobInsertFastMany(ctx, finalInsertParams)
+		if err != nil {
+			return nil, err
+		}
+		return sliceutil.Map(results,
+			func(result *riverdriver.JobInsertFastResult) *rivertype.JobInsertResult {
+				return (*rivertype.JobInsertResult)(result)
+			},
+		), nil
 	}
 
 	setup := func(t *testing.T) (*PeriodicJobEnqueuer, *testBundle) {
@@ -65,16 +102,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 			waitChan:             make(chan struct{}),
 		}
 
-		svc := NewPeriodicJobEnqueuer(
-			riversharedtest.BaseServiceArchetype(t),
-			&PeriodicJobEnqueuerConfig{
-				NotifyInsert: func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error {
-					for _, queue := range queues {
-						bundle.notificationsByQueue[queue]++
-					}
-					return nil
-				},
-			}, bundle.exec)
+		svc := NewPeriodicJobEnqueuer(riversharedtest.BaseServiceArchetype(t), &PeriodicJobEnqueuerConfig{Insert: insertFunc}, bundle.exec)
 		svc.StaggerStartupDisable(true)
 		svc.TestSignals.Init()
 
@@ -188,8 +216,6 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		svc.TestSignals.InsertedJobs.WaitOrTimeout()
 		requireNJobs(t, bundle.exec, "unique_periodic_job_500ms", 1)
-		// This initial insert should emit a notification:
-		svc.TestSignals.NotifiedQueues.WaitOrTimeout()
 
 		// Another insert was attempted, but there's still only one job due to
 		// uniqueness conditions.
@@ -198,14 +224,6 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		svc.TestSignals.InsertedJobs.WaitOrTimeout()
 		requireNJobs(t, bundle.exec, "unique_periodic_job_500ms", 1)
-
-		// Ensure that no notifications were emitted beyond the first one because no
-		// additional jobs were inserted:
-		select {
-		case queues := <-svc.TestSignals.NotifiedQueues.WaitC():
-			t.Fatalf("Expected no notification to be emitted, but got one for queues: %v", queues)
-		case <-time.After(100 * time.Millisecond):
-		}
 	})
 
 	t.Run("RunOnStart", func(t *testing.T) {
@@ -236,8 +254,8 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		svc.AddMany([]*PeriodicJob{
 			// skip this insert when it returns nil:
-			{ScheduleFunc: periodicIntervalSchedule(time.Second), ConstructorFunc: func() (*riverdriver.JobInsertFastParams, *dbunique.UniqueOpts, error) {
-				return nil, nil, ErrNoJobToInsert
+			{ScheduleFunc: periodicIntervalSchedule(time.Second), ConstructorFunc: func() (*rivertype.JobInsertParams, error) {
+				return nil, ErrNoJobToInsert
 			}, RunOnStart: true},
 		})
 
@@ -330,7 +348,6 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		for i := 0; i < 100; i++ {
 			svc.TestSignals.InsertedJobs.WaitOrTimeout()
-			svc.TestSignals.NotifiedQueues.WaitOrTimeout()
 		}
 	})
 
@@ -342,7 +359,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		svc := NewPeriodicJobEnqueuer(
 			riversharedtest.BaseServiceArchetype(t),
 			&PeriodicJobEnqueuerConfig{
-				NotifyInsert: func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error { return nil },
+				Insert: insertFunc,
 				PeriodicJobs: []*PeriodicJob{
 					{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorFunc("periodic_job_500ms", false), RunOnStart: true},
 					{ScheduleFunc: periodicIntervalSchedule(1500 * time.Millisecond), ConstructorFunc: jobConstructorFunc("periodic_job_1500ms", false), RunOnStart: true},
@@ -476,8 +493,8 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		var wg sync.WaitGroup
 
-		randomSleep := func() time.Duration {
-			return time.Duration(randutil.IntBetween(svc.Rand, 1, 5)) * time.Millisecond
+		randomSleep := func() {
+			time.Sleep(time.Duration(randutil.IntBetween(1, 5)) * time.Millisecond)
 		}
 
 		for i := 0; i < 10; i++ {
@@ -543,59 +560,6 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		stopped := svc.Stopped()
 		cancelFunc()
 		riversharedtest.WaitOrTimeout(t, stopped)
-	})
-
-	t.Run("TriggersNotificationsOnEachQueueWithNewlyAvailableJobs", func(t *testing.T) {
-		t.Parallel()
-
-		svc, _ := setup(t)
-
-		svc.AddMany([]*PeriodicJob{
-			{ScheduleFunc: periodicIntervalSchedule(5 * time.Second), ConstructorFunc: jobConstructorWithQueueFunc("periodic_job_5s", false, rivercommon.QueueDefault), RunOnStart: true},
-			{ScheduleFunc: periodicIntervalSchedule(5 * time.Second), ConstructorFunc: jobConstructorWithQueueFunc("periodic_job_15m", false, "queue2"), RunOnStart: true},
-			{ScheduleFunc: periodicIntervalSchedule(5 * time.Second), ConstructorFunc: jobConstructorWithQueueFunc("unique_periodic_job_5s", true, "unique"), RunOnStart: true},
-		})
-
-		queueCh := make(chan []string, 1)
-		svc.Config.NotifyInsert = func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error {
-			queueCh <- queues
-			return nil
-		}
-
-		startService(t, svc)
-		svc.TestSignals.EnteredLoop.WaitOrTimeout()
-
-		svc.TestSignals.InsertedJobs.WaitOrTimeout()
-		queues := svc.TestSignals.NotifiedQueues.WaitOrTimeout()
-		require.Equal(t, []string{rivercommon.QueueDefault, "queue2", "unique"}, queues)
-		require.Equal(t, queues, riversharedtest.WaitOrTimeout(t, queueCh))
-	})
-
-	t.Run("RollsBackUponErrorFromNotificationAttempt", func(t *testing.T) {
-		t.Parallel()
-
-		svc, bundle := setup(t)
-
-		svc.AddMany([]*PeriodicJob{
-			{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorFunc("unique_periodic_job_500ms", true)},
-		})
-
-		svc.Config.NotifyInsert = func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error {
-			return errors.New("test error")
-		}
-
-		startService(t, svc)
-		svc.TestSignals.EnteredLoop.WaitOrTimeout()
-
-		// Ensure that no jobs were inserted because the notification errored:
-		select {
-		case <-svc.TestSignals.InsertedJobs.WaitC():
-			t.Fatal("Expected no jobs to be inserted, but one was")
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		// Should be no jobs in the DB either:
-		requireNJobs(t, bundle.exec, "unique_periodic_job_500ms", 0)
 	})
 
 	t.Run("TimeUntilNextRun", func(t *testing.T) {

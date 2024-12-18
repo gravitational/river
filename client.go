@@ -23,9 +23,10 @@ import (
 	"github.com/riverqueue/river/internal/workunit"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
+	"github.com/riverqueue/river/rivershared/riverpilot"
 	"github.com/riverqueue/river/rivershared/startstop"
+	"github.com/riverqueue/river/rivershared/testsignal"
 	"github.com/riverqueue/river/rivershared/util/maputil"
-	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 	"github.com/riverqueue/river/rivertype"
@@ -66,9 +67,9 @@ type Config struct {
 	// only 32 bits of number space for advisory lock hashes, so it makes
 	// internally conflicting River-generated keys more likely.
 	//
-	// Advisory locks are currently only used for the fallback/slow path of
-	// unique job insertion where finalized states are included in a ByState
-	// configuration.
+	// Advisory locks are currently only used for the deprecated fallback/slow
+	// path of unique job insertion when pending, scheduled, available, or running
+	// are omitted from a customized ByState configuration.
 	AdvisoryLockPrefix int32
 
 	// CancelledJobRetentionPeriod is the amount of time to keep cancelled jobs
@@ -96,7 +97,7 @@ type Config struct {
 
 	// FetchCooldown is the minimum amount of time to wait between fetches of new
 	// jobs. Jobs will only be fetched *at most* this often, but if no new jobs
-	// are coming in via LISTEN/NOTIFY then feches may be delayed as long as
+	// are coming in via LISTEN/NOTIFY then fetches may be delayed as long as
 	// FetchPollInterval.
 	//
 	// Throughput is limited by this value.
@@ -130,6 +131,17 @@ type Config struct {
 	//
 	// If in doubt, leave this property empty.
 	ID string
+
+	// JobCleanerTimeout is the timeout of the individual queries within the job
+	// cleaner.
+	//
+	// Defaults to 30 seconds, which should be more than enough time for most
+	// deployments.
+	JobCleanerTimeout time.Duration
+
+	// JobInsertMiddleware are optional functions that can be called around job
+	// insertion.
+	JobInsertMiddleware []rivertype.JobInsertMiddleware
 
 	// JobTimeout is the maximum amount of time a job is allowed to run before its
 	// context is cancelled. A timeout of zero means JobTimeoutDefault will be
@@ -226,6 +238,10 @@ type Config struct {
 	// ahead of time that a worker is properly registered for an inserted job.
 	// (i.e.  That it wasn't forgotten by accident.)
 	Workers *Workers
+
+	// WorkerMiddleware are optional functions that can be called around
+	// all job executions.
+	WorkerMiddleware []rivertype.WorkerMiddleware
 
 	// Scheduler run interval. Shared between the scheduler and producer/job
 	// executors, but not currently exposed for configuration.
@@ -332,14 +348,14 @@ type Client[TTx any] struct {
 	insertNotifyLimiter  *notifylimiter.Limiter
 	notifier             *notifier.Notifier // may be nil in poll-only mode
 	periodicJobs         *PeriodicJobBundle
+	pilot                riverpilot.Pilot
 	producersByQueueName map[string]*producer
 	queueMaintainer      *maintenance.QueueMaintainer
 	queues               *QueueBundle
 	services             []startstop.Service
-	subscriptionManager  *subscriptionManager
 	stopped              <-chan struct{}
+	subscriptionManager  *subscriptionManager
 	testSignals          clientTestSignals
-	uniqueInserter       *dbunique.UniqueInserter
 
 	// workCancel cancels the context used for all work goroutines. Normal Stop
 	// does not cancel that context.
@@ -348,7 +364,7 @@ type Client[TTx any] struct {
 
 // Test-only signals.
 type clientTestSignals struct {
-	electedLeader rivercommon.TestSignal[struct{}] // notifies when elected leader
+	electedLeader testsignal.TestSignal[struct{}] // notifies when elected leader
 
 	jobCleaner          *maintenance.JobCleanerTestSignals
 	jobRescuer          *maintenance.JobRescuerTestSignals
@@ -441,7 +457,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 
 	// For convenience, in case the user's specified a large JobTimeout but no
 	// RescueStuckJobsAfter, since RescueStuckJobsAfter must be greater than
-	// JobTimeout, set a reasonable default value that's longer thah JobTimeout.
+	// JobTimeout, set a reasonable default value that's longer than JobTimeout.
 	rescueAfter := maintenance.JobRescuerRescueAfterDefault
 	if config.JobTimeout > 0 && config.RescueStuckJobsAfter < 1 && config.JobTimeout > config.RescueStuckJobsAfter {
 		rescueAfter = config.JobTimeout + maintenance.JobRescuerRescueAfterDefault
@@ -459,6 +475,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		FetchCooldown:               valutil.ValOrDefault(config.FetchCooldown, FetchCooldownDefault),
 		FetchPollInterval:           valutil.ValOrDefault(config.FetchPollInterval, FetchPollIntervalDefault),
 		ID:                          valutil.ValOrDefaultFunc(config.ID, func() string { return defaultClientID(time.Now().UTC()) }),
+		JobInsertMiddleware:         config.JobInsertMiddleware,
 		JobTimeout:                  valutil.ValOrDefault(config.JobTimeout, JobTimeoutDefault),
 		Logger:                      logger,
 		MaxAttempts:                 valutil.ValOrDefault(config.MaxAttempts, MaxAttemptsDefault),
@@ -470,6 +487,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		RetryPolicy:                 retryPolicy,
 		TestOnly:                    config.TestOnly,
 		Workers:                     config.Workers,
+		WorkerMiddleware:            config.WorkerMiddleware,
 		schedulerInterval:           valutil.ValOrDefault(config.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
 		time:                        config.time,
 	}
@@ -478,13 +496,9 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		return nil, err
 	}
 
-	archetype := &baseservice.Archetype{
-		Logger: config.Logger,
-		Rand:   randutil.NewCryptoSeededConcurrentSafeRand(),
-		Time:   config.time,
-	}
-	if archetype.Time == nil {
-		archetype.Time = &baseservice.UnStubbableTimeGenerator{}
+	archetype := baseservice.NewArchetype(config.Logger)
+	if config.time != nil {
+		archetype.Time = config.time
 	}
 
 	client := &Client[TTx]{
@@ -492,9 +506,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		driver:               driver,
 		producersByQueueName: make(map[string]*producer),
 		testSignals:          clientTestSignals{},
-		uniqueInserter: baseservice.Init(archetype, &dbunique.UniqueInserter{
-			AdvisoryLockPrefix: config.AdvisoryLockPrefix,
-		}),
+		workCancel:           func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 	}
 	client.queues = &QueueBundle{
 		addProducer:    client.addProducer,
@@ -508,7 +520,12 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 	plugin, _ := driver.(driverPlugin[TTx])
 	if plugin != nil {
 		plugin.PluginInit(archetype, client)
+		client.pilot = plugin.PluginPilot()
 	}
+	if client.pilot == nil {
+		client.pilot = &riverpilot.StandardPilot{}
+	}
+	client.pilot.PilotInit(archetype)
 
 	// There are a number of internal components that are only needed/desired if
 	// we're actually going to be working jobs (as opposed to just enqueueing
@@ -518,7 +535,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			return nil, errMissingDatabasePoolWithQueues
 		}
 
-		client.completer = jobcompleter.NewBatchCompleter(archetype, driver.GetExecutor(), nil)
+		client.completer = jobcompleter.NewBatchCompleter(archetype, driver.GetExecutor(), client.pilot, nil)
 		client.subscriptionManager = newSubscriptionManager(archetype, nil)
 		client.services = append(client.services, client.completer, client.subscriptionManager)
 
@@ -564,6 +581,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 				CancelledJobRetentionPeriod: config.CancelledJobRetentionPeriod,
 				CompletedJobRetentionPeriod: config.CompletedJobRetentionPeriod,
 				DiscardedJobRetentionPeriod: config.DiscardedJobRetentionPeriod,
+				Timeout:                     config.JobCleanerTimeout,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobCleaner)
 			client.testSignals.jobCleaner = &jobCleaner.TestSignals
@@ -596,7 +614,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		{
 			periodicJobEnqueuer := maintenance.NewPeriodicJobEnqueuer(archetype, &maintenance.PeriodicJobEnqueuerConfig{
 				AdvisoryLockPrefix: config.AdvisoryLockPrefix,
-				NotifyInsert:       client.maybeNotifyInsertForQueues,
+				Insert:             client.insertMany,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, periodicJobEnqueuer)
 			client.testSignals.periodicJobEnqueuer = &periodicJobEnqueuer.TestSignals
@@ -661,7 +679,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.queues.startStopMu.Lock()
 	defer c.queues.startStopMu.Unlock()
 
-	c.stopped = c.baseStartStop.Stopped()
+	// BaseStartStop will set its stopped channel to nil after it stops, so make
+	// sure to take a channel reference before finishing stopped.
+	c.stopped = c.baseStartStop.StoppedUnsafe()
 
 	producersAsServices := func() []startstop.Service {
 		return sliceutil.Map(
@@ -722,11 +742,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		// more aggressive stop will be initiated.
 		workCtx, workCancel := context.WithCancelCause(withClient[TTx](ctx, c))
 
-		for _, service := range c.services {
-			if err := service.Start(fetchCtx); err != nil {
-				stopServicesOnError()
-				return err
-			}
+		if err := startstop.StartAll(fetchCtx, c.services...); err != nil {
+			stopServicesOnError()
+			return err
 		}
 
 		for _, producer := range c.producersByQueueName {
@@ -739,7 +757,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 			}
 		}
 
-		c.queues.fetchCtx = fetchCtx
+		c.queues.fetchCtx = fetchCtx //nolint:fatcontext
 		c.queues.workCtx = workCtx
 		c.workCancel = workCancel
 
@@ -906,12 +924,16 @@ type SubscribeConfig struct {
 	// Requiring that kinds are specified explicitly allows for forward
 	// compatibility in case new kinds of events are added in future versions.
 	// If new event kinds are added, callers will have to explicitly add them to
-	// their requested list and esnure they can be handled correctly.
+	// their requested list and ensure they can be handled correctly.
 	Kinds []EventKind
 }
 
 // Special internal variant that lets us inject an overridden size.
 func (c *Client[TTx]) SubscribeConfig(config *SubscribeConfig) (<-chan *Event, func()) {
+	if c.subscriptionManager == nil {
+		panic("created a subscription on a client that will never work jobs (Workers not configured)")
+	}
+
 	return c.subscriptionManager.SubscribeConfig(config)
 }
 
@@ -1040,7 +1062,7 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, jobID int64) (*rivertype.Jo
 
 // JobCancelTx cancels the job with the given ID within the specified
 // transaction. This variant lets a caller cancel a job atomically alongside
-// other database changes. An cancelled job doesn't take effect until the
+// other database changes. A cancelled job doesn't take effect until the
 // transaction commits, and if the transaction rolls back, so too is the
 // cancelled job.
 //
@@ -1156,10 +1178,10 @@ func (c *Client[TTx]) ID() string {
 	return c.config.ID
 }
 
-func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, config *Config, args JobArgs, insertOpts *InsertOpts) (*riverdriver.JobInsertFastParams, *dbunique.UniqueOpts, error) {
+func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, config *Config, args JobArgs, insertOpts *InsertOpts) (*rivertype.JobInsertParams, error) {
 	encodedArgs, err := json.Marshal(args)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error marshaling args to JSON: %w", err)
+		return nil, fmt.Errorf("error marshaling args to JSON: %w", err)
 	}
 
 	if insertOpts == nil {
@@ -1181,7 +1203,7 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	queue := valutil.FirstNonZero(insertOpts.Queue, jobInsertOpts.Queue, rivercommon.QueueDefault)
 
 	if err := validateQueueName(queue); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	tags := insertOpts.Tags
@@ -1193,16 +1215,16 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	} else {
 		for _, tag := range tags {
 			if len(tag) > 255 {
-				return nil, nil, errors.New("tags should be a maximum of 255 characters long")
+				return nil, errors.New("tags should be a maximum of 255 characters long")
 			}
 			if !tagRE.MatchString(tag) {
-				return nil, nil, errors.New("tags should match regex " + tagRE.String())
+				return nil, errors.New("tags should match regex " + tagRE.String())
 			}
 		}
 	}
 
 	if priority > 4 {
-		return nil, nil, errors.New("priority must be between 1 and 4")
+		return nil, errors.New("priority must be between 1 and 4")
 	}
 
 	uniqueOpts := insertOpts.UniqueOpts
@@ -1210,7 +1232,7 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		uniqueOpts = jobInsertOpts.UniqueOpts
 	}
 	if err := uniqueOpts.validate(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	metadata := insertOpts.Metadata
@@ -1218,16 +1240,25 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		metadata = []byte("{}")
 	}
 
-	insertParams := &riverdriver.JobInsertFastParams{
+	insertParams := &rivertype.JobInsertParams{
+		Args:        args,
 		CreatedAt:   createdAt,
-		EncodedArgs: json.RawMessage(encodedArgs),
+		EncodedArgs: encodedArgs,
 		Kind:        args.Kind(),
 		MaxAttempts: maxAttempts,
-		Metadata:    json.RawMessage(metadata),
+		Metadata:    metadata,
 		Priority:    priority,
 		Queue:       queue,
 		State:       rivertype.JobStateAvailable,
 		Tags:        tags,
+	}
+	if !uniqueOpts.isEmpty() {
+		internalUniqueOpts := (*dbunique.UniqueOpts)(&uniqueOpts)
+		insertParams.UniqueKey, err = dbunique.UniqueKey(archetype.Time, internalUniqueOpts, insertParams)
+		if err != nil {
+			return nil, err
+		}
+		insertParams.UniqueStates = internalUniqueOpts.StateBitmask()
 	}
 
 	switch {
@@ -1247,7 +1278,7 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		insertParams.State = rivertype.JobStatePending
 	}
 
-	return insertParams, (*dbunique.UniqueOpts)(&uniqueOpts), nil
+	return insertParams, nil
 }
 
 var errNoDriverDBPool = errors.New("driver must have non-nil database pool to use non-transactional methods like Insert and InsertMany (try InsertTx or InsertManyTx instead")
@@ -1267,7 +1298,21 @@ func (c *Client[TTx]) Insert(ctx context.Context, args JobArgs, opts *InsertOpts
 		return nil, errNoDriverDBPool
 	}
 
-	return c.insert(ctx, c.driver.GetExecutor(), args, opts)
+	tx, err := c.driver.GetExecutor().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	inserted, err := c.insert(ctx, tx, args, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return inserted, nil
 }
 
 // InsertTx inserts a new job with the provided args on the given transaction.
@@ -1282,41 +1327,23 @@ func (c *Client[TTx]) Insert(ctx context.Context, args JobArgs, opts *InsertOpts
 //	}
 //
 // This variant lets a caller insert jobs atomically alongside other database
-// changes. An inserted job isn't visible to be worked until the transaction
-// commits, and if the transaction rolls back, so too is the inserted job.
+// changes. It's also possible to insert a job outside a transaction, but this
+// usage is recommended to ensure that all data a job needs to run is available
+// by the time it starts. Because of snapshot visibility guarantees across
+// transactions, the job will not be worked until the transaction has committed,
+// and if the transaction rolls back, so too is the inserted job.
 func (c *Client[TTx]) InsertTx(ctx context.Context, tx TTx, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
 	return c.insert(ctx, c.driver.UnwrapExecutor(tx), args, opts)
 }
 
-func (c *Client[TTx]) insert(ctx context.Context, exec riverdriver.Executor, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
-	if err := c.validateJobArgs(args); err != nil {
-		return nil, err
-	}
-
-	params, uniqueOpts, err := insertParamsFromConfigArgsAndOptions(&c.baseService.Archetype, c.config, args, opts)
+func (c *Client[TTx]) insert(ctx context.Context, tx riverdriver.ExecutorTx, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
+	params := []InsertManyParams{{Args: args, InsertOpts: opts}}
+	results, err := c.validateParamsAndInsertMany(ctx, tx, params)
 	if err != nil {
 		return nil, err
 	}
 
-	tx, err := exec.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	jobInsertRes, err := c.uniqueInserter.JobInsert(ctx, tx, params, uniqueOpts)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := c.maybeNotifyInsert(ctx, tx, params.State, params.Queue); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-
-	return jobInsertRes, nil
+	return results[0], nil
 }
 
 // InsertManyParams encapsulates a single job combined with insert options for
@@ -1329,9 +1356,8 @@ type InsertManyParams struct {
 	InsertOpts *InsertOpts
 }
 
-// InsertMany inserts many jobs at once using Postgres' `COPY FROM` mechanism,
-// making the operation quite fast and memory efficient. Each job is inserted as
-// an InsertManyParams tuple, which takes job args along with an optional set of
+// InsertMany inserts many jobs at once. Each job is inserted as an
+// InsertManyParams tuple, which takes job args along with an optional set of
 // insert options, which override insert options provided by an
 // JobArgsWithInsertOpts.InsertOpts implementation or any client-level defaults.
 // The provided context is used for the underlying Postgres inserts and can be
@@ -1348,14 +1374,181 @@ type InsertManyParams struct {
 // Job uniqueness is not respected when using InsertMany due to unique inserts
 // using an internal transaction and advisory lock that might lead to
 // significant lock contention. Insert unique jobs using Insert instead.
-func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams) (int, error) {
+//
+// Job uniqueness is not respected when using InsertMany due to unique inserts
+// using an internal transaction and advisory lock that might lead to
+// significant lock contention. Insert unique jobs using Insert instead.
+func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
 	if !c.driver.HasPool() {
-		return 0, errNoDriverDBPool
+		return nil, errNoDriverDBPool
 	}
 
+	tx, err := c.driver.GetExecutor().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	inserted, err := c.validateParamsAndInsertMany(ctx, tx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return inserted, nil
+}
+
+// InsertManyTx inserts many jobs at once. Each job is inserted as an
+// InsertManyParams tuple, which takes job args along with an optional set of
+// insert options, which override insert options provided by an
+// JobArgsWithInsertOpts.InsertOpts implementation or any client-level defaults.
+// The provided context is used for the underlying Postgres inserts and can be
+// used to cancel the operation or apply a timeout.
+//
+//	count, err := client.InsertManyTx(ctx, tx, []river.InsertManyParams{
+//		{Args: BatchInsertArgs{}},
+//		{Args: BatchInsertArgs{}, InsertOpts: &river.InsertOpts{Priority: 3}},
+//	})
+//	if err != nil {
+//		// handle error
+//	}
+//
+// Job uniqueness is not respected when using InsertMany due to unique inserts
+// using an internal transaction and advisory lock that might lead to
+// significant lock contention. Insert unique jobs using Insert instead.
+//
+// This variant lets a caller insert jobs atomically alongside other database
+// changes. An inserted job isn't visible to be worked until the transaction
+// commits, and if the transaction rolls back, so too is the inserted job.
+func (c *Client[TTx]) InsertManyTx(ctx context.Context, tx TTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
+	exec := c.driver.UnwrapExecutor(tx)
+	return c.validateParamsAndInsertMany(ctx, exec, params)
+}
+
+// validateParamsAndInsertMany is a helper method that wraps the insertMany
+// method to provide param validation and conversion prior to calling the actual
+// insertMany method. This allows insertMany to be reused by the
+// PeriodicJobEnqueuer which cannot reference top-level river package types.
+func (c *Client[TTx]) validateParamsAndInsertMany(ctx context.Context, tx riverdriver.ExecutorTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
 	insertParams, err := c.insertManyParams(params)
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+
+	return c.insertMany(ctx, tx, insertParams)
+}
+
+// insertMany is a shared code path for InsertMany and InsertManyTx, also used
+// by the PeriodicJobEnqueuer.
+func (c *Client[TTx]) insertMany(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
+	return c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
+		results, err := c.pilot.JobInsertMany(ctx, tx, insertParams)
+		if err != nil {
+			return nil, err
+		}
+
+		return sliceutil.Map(results,
+			func(result *riverdriver.JobInsertFastResult) *rivertype.JobInsertResult {
+				return (*rivertype.JobInsertResult)(result)
+			},
+		), nil
+	})
+}
+
+// The shared code path for all Insert and InsertMany methods. It takes a
+// function that executes the actual insert operation and allows for different
+// implementations of the insert query to be passed in, each mapping their
+// results back to a common result type.
+func (c *Client[TTx]) insertManyShared(
+	ctx context.Context,
+	tx riverdriver.ExecutorTx,
+	insertParams []*rivertype.JobInsertParams,
+	execute func(context.Context, []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error),
+) ([]*rivertype.JobInsertResult, error) {
+	doInner := func(ctx context.Context) ([]*rivertype.JobInsertResult, error) {
+		finalInsertParams := sliceutil.Map(insertParams, func(params *rivertype.JobInsertParams) *riverdriver.JobInsertFastParams {
+			return (*riverdriver.JobInsertFastParams)(params)
+		})
+		results, err := execute(ctx, finalInsertParams)
+		if err != nil {
+			return results, err
+		}
+
+		queues := make([]string, 0, 10)
+		for _, params := range insertParams {
+			if params.State == rivertype.JobStateAvailable {
+				queues = append(queues, params.Queue)
+			}
+		}
+		if err := c.maybeNotifyInsertForQueues(ctx, tx, queues); err != nil {
+			return nil, err
+		}
+		return results, nil
+	}
+
+	if len(c.config.JobInsertMiddleware) > 0 {
+		// Wrap middlewares in reverse order so the one defined first is wrapped
+		// as the outermost function and is first to receive the operation.
+		for i := len(c.config.JobInsertMiddleware) - 1; i >= 0; i-- {
+			middlewareItem := c.config.JobInsertMiddleware[i] // capture the current middleware item
+			previousDoInner := doInner                        // Capture the current doInner function
+			doInner = func(ctx context.Context) ([]*rivertype.JobInsertResult, error) {
+				return middlewareItem.InsertMany(ctx, insertParams, previousDoInner)
+			}
+		}
+	}
+
+	return doInner(ctx)
+}
+
+// Validates input parameters for a batch insert operation and generates a set
+// of batch insert parameters.
+func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*rivertype.JobInsertParams, error) {
+	if len(params) < 1 {
+		return nil, errors.New("no jobs to insert")
+	}
+
+	insertParams := make([]*rivertype.JobInsertParams, len(params))
+	for i, param := range params {
+		if err := c.validateJobArgs(param.Args); err != nil {
+			return nil, err
+		}
+
+		insertParamsItem, err := insertParamsFromConfigArgsAndOptions(&c.baseService.Archetype, c.config, param.Args, param.InsertOpts)
+		if err != nil {
+			return nil, err
+		}
+
+		insertParams[i] = insertParamsItem
+	}
+
+	return insertParams, nil
+}
+
+// InsertManyFast inserts many jobs at once using Postgres' `COPY FROM` mechanism,
+// making the operation quite fast and memory efficient. Each job is inserted as
+// an InsertManyParams tuple, which takes job args along with an optional set of
+// insert options, which override insert options provided by an
+// JobArgsWithInsertOpts.InsertOpts implementation or any client-level defaults.
+// The provided context is used for the underlying Postgres inserts and can be
+// used to cancel the operation or apply a timeout.
+//
+//	count, err := client.InsertMany(ctx, []river.InsertManyParams{
+//		{Args: BatchInsertArgs{}},
+//		{Args: BatchInsertArgs{}, InsertOpts: &river.InsertOpts{Priority: 3}},
+//	})
+//	if err != nil {
+//		// handle error
+//	}
+//
+// Job uniqueness is supported using this path, but unlike with `InsertMany`
+// unique conflicts cannot be handled gracefully. If a unique constraint is
+// violated, the operation will fail and no jobs will be inserted.
+func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyParams) (int, error) {
+	if !c.driver.HasPool() {
+		return 0, errNoDriverDBPool
 	}
 
 	// Wrap in a transaction in case we need to notify about inserts.
@@ -1365,7 +1558,7 @@ func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams)
 	}
 	defer tx.Rollback(ctx)
 
-	inserted, err := c.insertFastMany(ctx, tx, insertParams)
+	inserted, err := c.insertManyFast(ctx, tx, params)
 	if err != nil {
 		return 0, err
 	}
@@ -1391,78 +1584,36 @@ func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams)
 //		// handle error
 //	}
 //
-// Job uniqueness is not respected when using InsertManyTx due to unique inserts
-// using an internal transaction and advisory lock that might lead to
-// significant lock contention. Insert unique jobs using InsertTx instead.
-//
 // This variant lets a caller insert jobs atomically alongside other database
 // changes. An inserted job isn't visible to be worked until the transaction
 // commits, and if the transaction rolls back, so too is the inserted job.
-func (c *Client[TTx]) InsertManyTx(ctx context.Context, tx TTx, params []InsertManyParams) (int, error) {
+//
+// Job uniqueness is supported using this path, but unlike with `InsertManyTx`
+// unique conflicts cannot be handled gracefully. If a unique constraint is
+// violated, the operation will fail and no jobs will be inserted.
+func (c *Client[TTx]) InsertManyFastTx(ctx context.Context, tx TTx, params []InsertManyParams) (int, error) {
+	exec := c.driver.UnwrapExecutor(tx)
+	return c.insertManyFast(ctx, exec, params)
+}
+
+func (c *Client[TTx]) insertManyFast(ctx context.Context, tx riverdriver.ExecutorTx, params []InsertManyParams) (int, error) {
 	insertParams, err := c.insertManyParams(params)
 	if err != nil {
 		return 0, err
 	}
 
-	exec := c.driver.UnwrapExecutor(tx)
-	return c.insertFastMany(ctx, exec, insertParams)
-}
-
-func (c *Client[TTx]) insertFastMany(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*riverdriver.JobInsertFastParams) (int, error) {
-	inserted, err := tx.JobInsertFastMany(ctx, insertParams)
-	if err != nil {
-		return inserted, err
-	}
-
-	queues := make([]string, 0, 10)
-	for _, params := range insertParams {
-		if params.State == rivertype.JobStateAvailable {
-			queues = append(queues, params.Queue)
-		}
-	}
-	if err := c.maybeNotifyInsertForQueues(ctx, tx, queues); err != nil {
-		return 0, err
-	}
-	return inserted, nil
-}
-
-// Validates input parameters for an a batch insert operation and generates a
-// set of batch insert parameters.
-func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*riverdriver.JobInsertFastParams, error) {
-	if len(params) < 1 {
-		return nil, errors.New("no jobs to insert")
-	}
-
-	insertParams := make([]*riverdriver.JobInsertFastParams, len(params))
-	for i, param := range params {
-		if err := c.validateJobArgs(param.Args); err != nil {
-			return nil, err
-		}
-
-		if param.InsertOpts != nil {
-			// UniqueOpts aren't support for batch inserts because they use PG
-			// advisory locks to work, and taking many locks simultaneously
-			// could easily lead to contention and deadlocks.
-			if !param.InsertOpts.UniqueOpts.isEmpty() {
-				return nil, errors.New("UniqueOpts are not supported for batch inserts")
-			}
-		}
-
-		var err error
-		insertParams[i], _, err = insertParamsFromConfigArgsAndOptions(&c.baseService.Archetype, c.config, param.Args, param.InsertOpts)
+	results, err := c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
+		count, err := tx.JobInsertFastManyNoReturning(ctx, insertParams)
 		if err != nil {
 			return nil, err
 		}
+		return make([]*rivertype.JobInsertResult, count), nil
+	})
+	if err != nil {
+		return 0, err
 	}
 
-	return insertParams, nil
-}
-
-func (c *Client[TTx]) maybeNotifyInsert(ctx context.Context, tx riverdriver.ExecutorTx, state rivertype.JobState, queue string) error {
-	if state != rivertype.JobStateAvailable {
-		return nil
-	}
-	return c.maybeNotifyInsertForQueues(ctx, tx, []string{queue})
+	return len(results), nil
 }
 
 // Notify the given queues that new jobs are available. The queues list will be
@@ -1561,6 +1712,7 @@ func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) *pr
 		ErrorHandler:       c.config.ErrorHandler,
 		FetchCooldown:      c.config.FetchCooldown,
 		FetchPollInterval:  c.config.FetchPollInterval,
+		GlobalMiddleware:   c.config.WorkerMiddleware,
 		JobTimeout:         c.config.JobTimeout,
 		MaxWorkers:         queueConfig.MaxWorkers,
 		Notifier:           c.notifier,
@@ -1676,6 +1828,13 @@ func (c *Client[TTx]) JobListTx(ctx context.Context, tx TTx, params *JobListPara
 // PeriodicJobs returns the currently configured set of periodic jobs for the
 // client, and can be used to add new ones or remove existing ones.
 func (c *Client[TTx]) PeriodicJobs() *PeriodicJobBundle { return c.periodicJobs }
+
+// Driver exposes the underlying pilot used by the client.
+//
+// API is not stable. DO NOT USE.
+func (c *Client[TTx]) Pilot() riverpilot.Pilot {
+	return c.pilot
+}
 
 // Queues returns the currently configured set of queues for the client, and can
 // be used to add new ones.

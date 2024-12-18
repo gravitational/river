@@ -19,8 +19,8 @@ import (
 	"github.com/riverqueue/river/internal/util/dbutil"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
+	"github.com/riverqueue/river/rivershared/levenshtein"
 	"github.com/riverqueue/river/rivershared/util/maputil"
-	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 )
@@ -93,8 +93,11 @@ type Migrator[TTx any] struct {
 //	}
 //	defer dbPool.Close()
 //
-//	migrator := rivermigrate.New(riverpgxv5.New(dbPool), nil)
-func New[TTx any](driver riverdriver.Driver[TTx], config *Config) *Migrator[TTx] {
+//	migrator, err := rivermigrate.New(riverpgxv5.New(dbPool), nil)
+//	if err != nil {
+//		// handle error
+//	}
+func New[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Migrator[TTx], error) {
 	if config == nil {
 		config = &Config{}
 	}
@@ -110,12 +113,28 @@ func New[TTx any](driver riverdriver.Driver[TTx], config *Config) *Migrator[TTx]
 
 	archetype := &baseservice.Archetype{
 		Logger: logger,
-		Rand:   randutil.NewCryptoSeededConcurrentSafeRand(),
 		Time:   &baseservice.UnStubbableTimeGenerator{},
 	}
 
 	if !slices.Contains(driver.GetMigrationLines(), line) {
-		panic("migration line does not exist: " + line)
+		const minLevenshteinDistance = 2
+
+		var suggestedLines []string
+		for _, existingLine := range driver.GetMigrationLines() {
+			if distance := levenshtein.ComputeDistance(existingLine, line); distance <= minLevenshteinDistance {
+				suggestedLines = append(suggestedLines, "`"+existingLine+"`")
+			}
+		}
+
+		errorStr := "migration line does not exist: " + line
+		switch {
+		case len(suggestedLines) == 1:
+			errorStr += fmt.Sprintf(" (did you mean %s?)", suggestedLines[0])
+		case len(suggestedLines) > 1:
+			errorStr += fmt.Sprintf(" (did you mean one of %v?)", strings.Join(suggestedLines, ", "))
+		}
+
+		return nil, errors.New(errorStr)
 	}
 
 	riverMigrations, err := migrationsFromFS(driver.GetMigrationFS(line), line)
@@ -129,7 +148,53 @@ func New[TTx any](driver riverdriver.Driver[TTx], config *Config) *Migrator[TTx]
 		driver:     driver,
 		line:       line,
 		migrations: validateAndInit(riverMigrations),
-	})
+	}), nil
+}
+
+// ExistingVersions gets the existing set of versions that have been migrated in
+// the database, ordered by version.
+func (m *Migrator[TTx]) ExistingVersions(ctx context.Context) ([]Migration, error) {
+	migrations, err := m.existingMigrations(ctx, m.driver.GetExecutor())
+	if err != nil {
+		return nil, err
+	}
+
+	versions, err := m.versionsFromDriver(migrations)
+	if err != nil {
+		return nil, err
+	}
+
+	return versions, nil
+}
+
+// ExistingVersions gets the existing set of versions that have been migrated in
+// the database, ordered by version.
+//
+// This variant checks for existing versions in a transaction.
+func (m *Migrator[TTx]) ExistingVersionsTx(ctx context.Context, tx TTx) ([]Migration, error) {
+	migrations, err := m.existingMigrations(ctx, m.driver.UnwrapExecutor(tx))
+	if err != nil {
+		return nil, err
+	}
+
+	versions, err := m.versionsFromDriver(migrations)
+	if err != nil {
+		return nil, err
+	}
+
+	return versions, nil
+}
+
+func (m *Migrator[TTx]) versionsFromDriver(migrations []*riverdriver.Migration) ([]Migration, error) {
+	versions := make([]Migration, len(migrations))
+	for i, existingMigration := range migrations {
+		migration, ok := m.migrations[existingMigration.Version]
+		if !ok {
+			return nil, fmt.Errorf("migration %d not found in migrator bundle", existingMigration.Version)
+		}
+		versions[i] = migration
+	}
+	return versions, nil
 }
 
 // MigrateOpts are options for a migrate operation.
@@ -152,7 +217,7 @@ type MigrateOpts struct {
 	// version, so when starting at version 0 and requesting version 3, versions
 	// 1, 2, and 3 would be applied. When applying migrations down, down
 	// migrations are applied excluding the target version, so when starting at
-	// version 5 an requesting version 3, down migrations for versions 5 and 4
+	// version 5 and requesting version 3, down migrations for versions 5 and 4
 	// would be applied, leaving the final schema at version 3.
 	//
 	// When migrating down, TargetVersion can be set to the special value of -1
@@ -230,16 +295,15 @@ func (m *Migrator[TTx]) GetVersion(version int) (Migration, error) {
 //		// handle error
 //	}
 func (m *Migrator[TTx]) Migrate(ctx context.Context, direction Direction, opts *MigrateOpts) (*MigrateResult, error) {
-	return dbutil.WithTxV(ctx, m.driver.GetExecutor(), func(ctx context.Context, exec riverdriver.ExecutorTx) (*MigrateResult, error) {
-		switch direction {
-		case DirectionDown:
-			return m.migrateDown(ctx, exec, direction, opts)
-		case DirectionUp:
-			return m.migrateUp(ctx, exec, direction, opts)
-		}
+	exec := m.driver.GetExecutor()
+	switch direction {
+	case DirectionDown:
+		return m.migrateDown(ctx, exec, direction, opts)
+	case DirectionUp:
+		return m.migrateUp(ctx, exec, direction, opts)
+	}
 
-		panic("invalid direction: " + direction)
-	})
+	panic("invalid direction: " + direction)
 }
 
 // Migrate migrates the database in the given direction (up or down). The opts
@@ -260,6 +324,9 @@ func (m *Migrator[TTx]) Migrate(ctx context.Context, direction Direction, opts *
 // This variant lets a caller run migrations within a transaction. Postgres DDL
 // is transactional, so migration changes aren't visible until the transaction
 // commits, and are rolled back if the transaction rolls back.
+//
+// Deprecated: Use Migrate instead. Certain migrations cannot be batched together
+// in a single transaction, so this method is not recommended.
 func (m *Migrator[TTx]) MigrateTx(ctx context.Context, tx TTx, direction Direction, opts *MigrateOpts) (*MigrateResult, error) {
 	switch direction {
 	case DirectionDown:
@@ -493,10 +560,21 @@ func (m *Migrator[TTx]) applyMigrations(ctx context.Context, exec riverdriver.Ex
 
 		if !opts.DryRun {
 			start := time.Now()
-			_, err := exec.Exec(ctx, sql)
+
+			// Similar to ActiveRecord migrations, we wrap each individual migration
+			// in its own transaction.  Without this, certain migrations that require
+			// a commit on a preexisting operation (such as adding an enum value to be
+			// used in an immutable function) cannot succeed.
+			err := dbutil.WithTx(ctx, exec, func(ctx context.Context, exec riverdriver.ExecutorTx) error {
+				_, err := exec.Exec(ctx, sql)
+				if err != nil {
+					return fmt.Errorf("error applying version %03d [%s]: %w",
+						versionBundle.Version, strings.ToUpper(string(direction)), err)
+				}
+				return nil
+			})
 			if err != nil {
-				return nil, fmt.Errorf("error applying version %03d [%s]: %w",
-					versionBundle.Version, strings.ToUpper(string(direction)), err)
+				return nil, err
 			}
 			duration = time.Since(start)
 		}
@@ -574,7 +652,7 @@ func migrationsFromFS(migrationFS fs.FS, line string) ([]Migration, error) {
 			return fmt.Errorf("error walking FS: %w", err)
 		}
 
-		// The WalkDir callback is invoked for each embdedded subdirectory and
+		// The WalkDir callback is invoked for each embedded subdirectory and
 		// file. For our purposes here, we're only interested in files.
 		if entry.IsDir() {
 			return nil

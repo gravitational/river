@@ -18,6 +18,8 @@ import (
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/startstoptest"
 	"github.com/riverqueue/river/rivershared/util/maputil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 )
 
 func TestNotifier(t *testing.T) {
@@ -437,7 +439,7 @@ func TestNotifier(t *testing.T) {
 					require.NoError(t, err)
 
 					// Pause a random brief amount of time.
-					notifier.BaseService.CancellableSleepRandomBetween(ctx, 15*time.Millisecond, 50*time.Millisecond)
+					serviceutil.CancellableSleep(ctx, randutil.DurationBetween(15*time.Millisecond, 50*time.Millisecond))
 
 					sub.Unlisten(ctx)
 				}
@@ -478,7 +480,7 @@ func TestNotifier(t *testing.T) {
 
 		start(t, notifier)
 
-		// The service normally sleeps with a exponential backoff after an
+		// The service normally sleeps with an exponential backoff after an
 		// error, but we've disabled sleep above, so we can pull errors out of
 		// the test signal as quickly as we want.
 		require.EqualError(t, notifier.testSignals.BackoffError.WaitOrTimeout(), "error during wait 1")

@@ -18,13 +18,23 @@ on:
 
 jobs:
   build_and_test:
+    env:
+      # The special value "local" tells Go to use the bundled Go version rather
+      # than trying to fetch one according to a `toolchain` value in `go.mod`.
+      # This ensures that we're really running the Go version in the CI matrix
+      # rather than one that the Go command has upgraded to automatically.
+      GOTOOLCHAIN: local
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        # Run the 4 latest Postgres versions against the latest Go version:
         go-version:
-          - "1.22"
-          - "1.21"
-        postgres-version: [16, 15, 14]
+          - "1.23"
+        postgres-version: [14, 15, 16, 17]
+        include:
+          # Also run previous Go version against the latest Postgres version:
+          - go-version: "1.22"
+            postgres-version: 17
       fail-fast: false
     timeout-minutes: 5
 
@@ -51,12 +61,6 @@ jobs:
 
       - name: Display Go version
         run: go version
-
-      - name: Install dependencies
-        run: |
-          echo "::group::go get"
-          go get -t ./...
-          echo "::endgroup::"
 
       - name: Set up test DBs
         run: go run ./internal/cmd/testdbman create
@@ -157,8 +161,16 @@ jobs:
         run: river migrate-up --database-url $DATABASE_URL
         shell: bash
 
+      - name: river migrate-list
+        run: river migrate-list --database-url $DATABASE_URL
+        shell: bash
+
       - name: river validate
         run: river validate --database-url $DATABASE_URL
+        shell: bash
+
+      - name: river version
+        run: river version
         shell: bash
 
       - name: river bench
@@ -206,7 +218,7 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     env:
-      GOLANGCI_LINT_VERSION: v1.59
+      GOLANGCI_LINT_VERSION: v1.61.0
     permissions:
       contents: read
       # allow read access to pull request. Use with `only-new-issues` option.
@@ -248,7 +260,7 @@ jobs:
       - name: Setup sqlc
         uses: sqlc-dev/setup-sqlc@v4
         with:
-          sqlc-version: "1.26.0"
+          sqlc-version: "1.27.0"
 
       - name: Verify migrations match
         run: |
@@ -259,3 +271,18 @@ jobs:
         run: |
           echo "Make sure that all sqlc changes are checked in"
           make verify/sqlc
+
+  submodule_check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          check-latest: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check all go/toolchain directives match
+        run: CHECK=true make update-mod-go

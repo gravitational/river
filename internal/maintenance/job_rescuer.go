@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/internal/workunit"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
+	"github.com/riverqueue/river/rivershared/testsignal"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 	"github.com/riverqueue/river/rivertype"
@@ -30,8 +32,8 @@ type ClientRetryPolicy interface {
 
 // Test-only properties.
 type JobRescuerTestSignals struct {
-	FetchedBatch rivercommon.TestSignal[struct{}] // notifies when runOnce has fetched a batch of jobs
-	UpdatedBatch rivercommon.TestSignal[struct{}] // notifies when runOnce has updated rescued jobs from a batch
+	FetchedBatch testsignal.TestSignal[struct{}] // notifies when runOnce has fetched a batch of jobs
+	UpdatedBatch testsignal.TestSignal[struct{}] // notifies when runOnce has updated rescued jobs from a batch
 }
 
 func (ts *JobRescuerTestSignals) Init() {
@@ -41,7 +43,7 @@ func (ts *JobRescuerTestSignals) Init() {
 
 type JobRescuerConfig struct {
 	// ClientRetryPolicy is the default retry policy to use for workers that don't
-	// overide NextRetry.
+	// override NextRetry.
 	ClientRetryPolicy ClientRetryPolicy
 
 	// Interval is the amount of time to wait between runs of the rescuer.
@@ -234,7 +236,7 @@ func (s *JobRescuer) runOnce(ctx context.Context) (*rescuerRunOnceResult, error)
 			break
 		}
 
-		s.CancellableSleepRandomBetween(ctx, BatchBackoffMin, BatchBackoffMax)
+		serviceutil.CancellableSleep(ctx, randutil.DurationBetween(BatchBackoffMin, BatchBackoffMax))
 	}
 
 	return res, nil

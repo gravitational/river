@@ -19,21 +19,22 @@ import (
 )
 
 type JobOpts struct {
-	Attempt     *int
-	AttemptedAt *time.Time
-	CreatedAt   *time.Time
-	EncodedArgs []byte
-	Errors      [][]byte
-	FinalizedAt *time.Time
-	Kind        *string
-	MaxAttempts *int
-	Metadata    json.RawMessage
-	Priority    *int
-	Queue       *string
-	ScheduledAt *time.Time
-	State       *rivertype.JobState
-	Tags        []string
-	UniqueKey   []byte
+	Attempt      *int
+	AttemptedAt  *time.Time
+	CreatedAt    *time.Time
+	EncodedArgs  []byte
+	Errors       [][]byte
+	FinalizedAt  *time.Time
+	Kind         *string
+	MaxAttempts  *int
+	Metadata     json.RawMessage
+	Priority     *int
+	Queue        *string
+	ScheduledAt  *time.Time
+	State        *rivertype.JobState
+	Tags         []string
+	UniqueKey    []byte
+	UniqueStates byte
 }
 
 func Job(ctx context.Context, tb testing.TB, exec riverdriver.Executor, opts *JobOpts) *rivertype.JobRow {
@@ -52,6 +53,13 @@ func Job_Build(tb testing.TB, opts *JobOpts) *riverdriver.JobInsertFullParams { 
 		encodedArgs = []byte("{}")
 	}
 
+	finalizedAt := opts.FinalizedAt
+	if finalizedAt == nil && (opts.State != nil && (*opts.State == rivertype.JobStateCompleted ||
+		*opts.State == rivertype.JobStateCancelled ||
+		*opts.State == rivertype.JobStateDiscarded)) {
+		finalizedAt = ptrutil.Ptr(time.Now())
+	}
+
 	metadata := opts.Metadata
 	if opts.Metadata == nil {
 		metadata = []byte("{}")
@@ -63,21 +71,22 @@ func Job_Build(tb testing.TB, opts *JobOpts) *riverdriver.JobInsertFullParams { 
 	}
 
 	return &riverdriver.JobInsertFullParams{
-		Attempt:     ptrutil.ValOrDefault(opts.Attempt, 0),
-		AttemptedAt: opts.AttemptedAt,
-		CreatedAt:   opts.CreatedAt,
-		EncodedArgs: encodedArgs,
-		Errors:      opts.Errors,
-		FinalizedAt: opts.FinalizedAt,
-		Kind:        ptrutil.ValOrDefault(opts.Kind, "fake_job"),
-		MaxAttempts: ptrutil.ValOrDefault(opts.MaxAttempts, rivercommon.MaxAttemptsDefault),
-		Metadata:    metadata,
-		Priority:    ptrutil.ValOrDefault(opts.Priority, rivercommon.PriorityDefault),
-		Queue:       ptrutil.ValOrDefault(opts.Queue, rivercommon.QueueDefault),
-		ScheduledAt: opts.ScheduledAt,
-		State:       ptrutil.ValOrDefault(opts.State, rivertype.JobStateAvailable),
-		Tags:        tags,
-		UniqueKey:   opts.UniqueKey,
+		Attempt:      ptrutil.ValOrDefault(opts.Attempt, 0),
+		AttemptedAt:  opts.AttemptedAt,
+		CreatedAt:    opts.CreatedAt,
+		EncodedArgs:  encodedArgs,
+		Errors:       opts.Errors,
+		FinalizedAt:  finalizedAt,
+		Kind:         ptrutil.ValOrDefault(opts.Kind, "fake_job"),
+		MaxAttempts:  ptrutil.ValOrDefault(opts.MaxAttempts, rivercommon.MaxAttemptsDefault),
+		Metadata:     metadata,
+		Priority:     ptrutil.ValOrDefault(opts.Priority, rivercommon.PriorityDefault),
+		Queue:        ptrutil.ValOrDefault(opts.Queue, rivercommon.QueueDefault),
+		ScheduledAt:  opts.ScheduledAt,
+		State:        ptrutil.ValOrDefault(opts.State, rivertype.JobStateAvailable),
+		Tags:         tags,
+		UniqueKey:    opts.UniqueKey,
+		UniqueStates: opts.UniqueStates,
 	}
 }
 

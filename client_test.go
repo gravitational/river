@@ -20,19 +20,23 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/sjson"
 
+	"github.com/riverqueue/river/internal/dbunique"
 	"github.com/riverqueue/river/internal/maintenance"
 	"github.com/riverqueue/river/internal/notifier"
 	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/internal/riverinternaltest"
-	"github.com/riverqueue/river/internal/riverinternaltest/testfactory"
 	"github.com/riverqueue/river/internal/util/dbutil"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/startstoptest"
+	"github.com/riverqueue/river/rivershared/testfactory"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -377,6 +381,36 @@ func Test_Client(t *testing.T) {
 		require.WithinDuration(t, time.Now(), *updatedJob.FinalizedAt, 2*time.Second)
 	})
 
+	t.Run("JobCancelErrorReturnedWithNilErr", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		type JobArgs struct {
+			JobArgsReflectKind[JobArgs]
+		}
+
+		AddWorker(client.config.Workers, WorkFunc(func(ctx context.Context, job *Job[JobArgs]) error {
+			return JobCancel(nil)
+		}))
+
+		subscribeChan := subscribe(t, client)
+		startClient(ctx, t, client)
+
+		insertRes, err := client.Insert(ctx, &JobArgs{}, nil)
+		require.NoError(t, err)
+
+		event := riversharedtest.WaitOrTimeout(t, subscribeChan)
+		require.Equal(t, EventKindJobCancelled, event.Kind)
+		require.Equal(t, rivertype.JobStateCancelled, event.Job.State)
+		require.WithinDuration(t, time.Now(), *event.Job.FinalizedAt, 2*time.Second)
+
+		updatedJob, err := client.JobGet(ctx, insertRes.Job.ID)
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateCancelled, updatedJob.State)
+		require.WithinDuration(t, time.Now(), *updatedJob.FinalizedAt, 2*time.Second)
+	})
+
 	t.Run("JobSnoozeErrorReturned", func(t *testing.T) {
 		t.Parallel()
 
@@ -411,8 +445,12 @@ func Test_Client(t *testing.T) {
 	// _outside of_ a transaction. The exact same test logic applies to each case,
 	// the only difference is a different cancelFunc provided by the specific
 	// subtest.
-	cancelRunningJobTestHelper := func(t *testing.T, cancelFunc func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error)) { //nolint:thelper
-		client, bundle := setup(t)
+	cancelRunningJobTestHelper := func(t *testing.T, config *Config, cancelFunc func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error)) { //nolint:thelper
+		defaultConfig, bundle := setupConfig(t)
+		if config == nil {
+			config = defaultConfig
+		}
+		client := newTestClient(t, bundle.dbPool, config)
 
 		jobStartedChan := make(chan int64)
 
@@ -458,7 +496,17 @@ func Test_Client(t *testing.T) {
 	t.Run("CancelRunningJob", func(t *testing.T) {
 		t.Parallel()
 
-		cancelRunningJobTestHelper(t, func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error) {
+		cancelRunningJobTestHelper(t, nil, func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error) {
+			return client.JobCancel(ctx, jobID)
+		})
+	})
+
+	t.Run("CancelRunningJobWithLongPollInterval", func(t *testing.T) {
+		t.Parallel()
+
+		config := newTestConfig(t, nil)
+		config.FetchPollInterval = 60 * time.Second
+		cancelRunningJobTestHelper(t, config, func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error) {
 			return client.JobCancel(ctx, jobID)
 		})
 	})
@@ -466,7 +514,7 @@ func Test_Client(t *testing.T) {
 	t.Run("CancelRunningJobInTx", func(t *testing.T) {
 		t.Parallel()
 
-		cancelRunningJobTestHelper(t, func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error) {
+		cancelRunningJobTestHelper(t, nil, func(ctx context.Context, dbPool *pgxpool.Pool, client *Client[pgx.Tx], jobID int64) (*rivertype.JobRow, error) {
 			var (
 				job *rivertype.JobRow
 				err error
@@ -554,6 +602,90 @@ func Test_Client(t *testing.T) {
 		// PgError has SchemaName and TableName properties, but unfortunately
 		// neither contain a useful value in this case.
 		require.Equal(t, `relation "river_job" does not exist`, pgErr.Message)
+	})
+
+	t.Run("WithWorkerMiddleware", func(t *testing.T) {
+		t.Parallel()
+
+		_, bundle := setup(t)
+		middlewareCalled := false
+
+		type privateKey string
+
+		middleware := &overridableJobMiddleware{
+			workFunc: func(ctx context.Context, job *rivertype.JobRow, doInner func(ctx context.Context) error) error {
+				ctx = context.WithValue(ctx, privateKey("middleware"), "called")
+				middlewareCalled = true
+				return doInner(ctx)
+			},
+		}
+		bundle.config.WorkerMiddleware = []rivertype.WorkerMiddleware{middleware}
+
+		AddWorker(bundle.config.Workers, WorkFunc(func(ctx context.Context, job *Job[callbackArgs]) error {
+			require.Equal(t, "called", ctx.Value(privateKey("middleware")))
+			return nil
+		}))
+
+		driver := riverpgxv5.New(bundle.dbPool)
+		client, err := NewClient(driver, bundle.config)
+		require.NoError(t, err)
+
+		subscribeChan := subscribe(t, client)
+		startClient(ctx, t, client)
+
+		result, err := client.Insert(ctx, callbackArgs{}, nil)
+		require.NoError(t, err)
+
+		event := riversharedtest.WaitOrTimeout(t, subscribeChan)
+		require.Equal(t, EventKindJobCompleted, event.Kind)
+		require.Equal(t, result.Job.ID, event.Job.ID)
+		require.True(t, middlewareCalled)
+	})
+
+	t.Run("WithWorkerMiddlewareOnWorker", func(t *testing.T) {
+		t.Parallel()
+
+		_, bundle := setup(t)
+		middlewareCalled := false
+
+		type privateKey string
+
+		worker := &workerWithMiddleware[callbackArgs]{
+			workFunc: func(ctx context.Context, job *Job[callbackArgs]) error {
+				require.Equal(t, "called", ctx.Value(privateKey("middleware")))
+				return nil
+			},
+			middlewareFunc: func(job *Job[callbackArgs]) []rivertype.WorkerMiddleware {
+				require.Equal(t, "middleware_test", job.Args.Name, "JSON should be decoded before middleware is called")
+
+				return []rivertype.WorkerMiddleware{
+					&overridableJobMiddleware{
+						workFunc: func(ctx context.Context, job *rivertype.JobRow, doInner func(ctx context.Context) error) error {
+							ctx = context.WithValue(ctx, privateKey("middleware"), "called")
+							middlewareCalled = true
+							return doInner(ctx)
+						},
+					},
+				}
+			},
+		}
+
+		AddWorker(bundle.config.Workers, worker)
+
+		driver := riverpgxv5.New(bundle.dbPool)
+		client, err := NewClient(driver, bundle.config)
+		require.NoError(t, err)
+
+		subscribeChan := subscribe(t, client)
+		startClient(ctx, t, client)
+
+		result, err := client.Insert(ctx, callbackArgs{Name: "middleware_test"}, nil)
+		require.NoError(t, err)
+
+		event := riversharedtest.WaitOrTimeout(t, subscribeChan)
+		require.Equal(t, EventKindJobCompleted, event.Kind)
+		require.Equal(t, result.Job.ID, event.Job.ID)
+		require.True(t, middlewareCalled)
 	})
 
 	t.Run("PauseAndResumeSingleQueue", func(t *testing.T) {
@@ -802,6 +934,20 @@ func Test_Client(t *testing.T) {
 	})
 }
 
+type workerWithMiddleware[T JobArgs] struct {
+	WorkerDefaults[T]
+	workFunc       func(context.Context, *Job[T]) error
+	middlewareFunc func(*Job[T]) []rivertype.WorkerMiddleware
+}
+
+func (w *workerWithMiddleware[T]) Work(ctx context.Context, job *Job[T]) error {
+	return w.workFunc(ctx, job)
+}
+
+func (w *workerWithMiddleware[T]) Middleware(job *Job[T]) []rivertype.WorkerMiddleware {
+	return w.middlewareFunc(job)
+}
+
 func Test_Client_Stop(t *testing.T) {
 	t.Parallel()
 
@@ -838,7 +984,7 @@ func Test_Client_Stop(t *testing.T) {
 					require.NoError(t, err)
 
 					// Sleep a brief time between inserts.
-					client.baseService.CancellableSleepRandomBetween(ctx, 1*time.Microsecond, 10*time.Millisecond)
+					serviceutil.CancellableSleep(ctx, randutil.DurationBetween(1*time.Microsecond, 10*time.Millisecond))
 				}
 			}()
 		}
@@ -1048,18 +1194,6 @@ func Test_Client_StopAndCancel(t *testing.T) {
 
 		client := runNewTestClient(ctx, t, config)
 
-		insertRes, err := client.Insert(ctx, &callbackArgs{}, nil)
-		require.NoError(t, err)
-
-		startedJobID := riversharedtest.WaitOrTimeout(t, jobStartedChan)
-		require.Equal(t, insertRes.Job.ID, startedJobID)
-
-		select {
-		case <-client.Stopped():
-			t.Fatal("expected client to not be stopped yet")
-		default:
-		}
-
 		return client, &testBundle{
 			jobDoneChan:    jobDoneChan,
 			jobStartedChan: jobStartedChan,
@@ -1069,16 +1203,39 @@ func Test_Client_StopAndCancel(t *testing.T) {
 	t.Run("OnItsOwn", func(t *testing.T) {
 		t.Parallel()
 
-		client, _ := setup(t)
+		client, bundle := setup(t)
+
+		startClient(ctx, t, client)
+
+		_, err := client.Insert(ctx, &callbackArgs{}, nil)
+		require.NoError(t, err)
+
+		riversharedtest.WaitOrTimeout(t, bundle.jobStartedChan)
 
 		require.NoError(t, client.StopAndCancel(ctx))
 		riversharedtest.WaitOrTimeout(t, client.Stopped())
+	})
+
+	t.Run("BeforeStart", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		require.NoError(t, client.StopAndCancel(ctx))
+		riversharedtest.WaitOrTimeout(t, client.Stopped()) // this works because Stopped is nil
 	})
 
 	t.Run("AfterStop", func(t *testing.T) {
 		t.Parallel()
 
 		client, bundle := setup(t)
+
+		startClient(ctx, t, client)
+
+		_, err := client.Insert(ctx, &callbackArgs{}, nil)
+		require.NoError(t, err)
+
+		riversharedtest.WaitOrTimeout(t, bundle.jobStartedChan)
 
 		go func() {
 			require.NoError(t, client.Stop(ctx))
@@ -1404,6 +1561,26 @@ func Test_Client_Insert(t *testing.T) {
 		require.NoError(t, client.Stop(ctx))
 	})
 
+	t.Run("WithUniqueOpts", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		job1, err := client.Insert(ctx, noOpArgs{Name: "foo"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.NotNil(t, job1)
+
+		// Dupe, same args:
+		job2, err := client.Insert(ctx, noOpArgs{Name: "foo"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.Equal(t, job1.Job.ID, job2.Job.ID)
+
+		// Not a dupe, different args
+		job3, err := client.Insert(ctx, noOpArgs{Name: "bar"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.NotEqual(t, job1.Job.ID, job3.Job.ID)
+	})
+
 	t.Run("ErrorsOnInvalidQueueName", func(t *testing.T) {
 		t.Parallel()
 
@@ -1532,6 +1709,26 @@ func Test_Client_InsertTx(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("WithUniqueOpts", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		job1, err := client.InsertTx(ctx, bundle.tx, noOpArgs{Name: "foo"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.NotNil(t, job1)
+
+		// Dupe, same args:
+		job2, err := client.InsertTx(ctx, bundle.tx, noOpArgs{Name: "foo"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.Equal(t, job1.Job.ID, job2.Job.ID)
+
+		// Not a dupe, different args
+		job3, err := client.InsertTx(ctx, bundle.tx, noOpArgs{Name: "bar"}, &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}})
+		require.NoError(t, err)
+		require.NotEqual(t, job1.Job.ID, job3.Job.ID)
+	})
+
 	t.Run("ErrorsOnUnknownJobKindWithWorkers", func(t *testing.T) {
 		t.Parallel()
 
@@ -1555,7 +1752,7 @@ func Test_Client_InsertTx(t *testing.T) {
 	})
 }
 
-func Test_Client_InsertMany(t *testing.T) {
+func Test_Client_InsertManyFast(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1579,7 +1776,7 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "foo", Priority: 2}},
 			{Args: noOpArgs{}},
 		})
@@ -1614,7 +1811,7 @@ func Test_Client_InsertMany(t *testing.T) {
 		startClient(ctx, t, client)
 		riversharedtest.WaitOrTimeout(t, client.baseStartStop.Started())
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: callbackArgs{}},
 			{Args: callbackArgs{}},
 		})
@@ -1630,7 +1827,7 @@ func Test_Client_InsertMany(t *testing.T) {
 		//
 		// Note: we specifically use a different queue to ensure that the notify
 		// limiter is immediately to fire on this queue.
-		count, err = client.InsertMany(ctx, []InsertManyParams{
+		count, err = client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: callbackArgs{}, InsertOpts: &InsertOpts{Queue: "another_queue"}},
 		})
 		require.NoError(t, err)
@@ -1662,7 +1859,7 @@ func Test_Client_InsertMany(t *testing.T) {
 		startClient(ctx, t, client)
 		riversharedtest.WaitOrTimeout(t, client.baseStartStop.Started())
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "a", ScheduledAt: time.Now().Add(1 * time.Hour)}},
 			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "b"}},
 		})
@@ -1682,7 +1879,7 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: &noOpArgs{}, InsertOpts: &InsertOpts{ScheduledAt: time.Time{}}},
 		})
 		require.NoError(t, err)
@@ -1700,7 +1897,7 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: &noOpArgs{}, InsertOpts: &InsertOpts{Queue: "invalid*queue"}},
 		})
 		require.ErrorContains(t, err, "queue name is invalid")
@@ -1717,7 +1914,7 @@ func Test_Client_InsertMany(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: noOpArgs{}},
 		})
 		require.ErrorIs(t, err, errNoDriverDBPool)
@@ -1729,7 +1926,7 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{})
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{})
 		require.EqualError(t, err, "no jobs to insert")
 		require.Equal(t, 0, count)
 	})
@@ -1739,7 +1936,7 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: unregisteredJobArgs{}},
 		})
 		var unknownJobKindErr *UnknownJobKindError
@@ -1755,22 +1952,447 @@ func Test_Client_InsertMany(t *testing.T) {
 
 		client.config.Workers = nil
 
-		_, err := client.InsertMany(ctx, []InsertManyParams{
+		_, err := client.InsertManyFast(ctx, []InsertManyParams{
 			{Args: unregisteredJobArgs{}},
 		})
 		require.NoError(t, err)
 	})
 
-	t.Run("ErrorsOnInsertOptsUniqueOpts", func(t *testing.T) {
+	t.Run("ErrorsOnInsertOptsWithoutRequiredUniqueStates", func(t *testing.T) {
 		t.Parallel()
 
 		client, _ := setup(t)
 
-		count, err := client.InsertMany(ctx, []InsertManyParams{
-			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}}},
+		count, err := client.InsertManyFast(ctx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{
+				ByArgs: true,
+				// force the v1 unique path with a custom state list that isn't supported in v3:
+				ByState: []rivertype.JobState{rivertype.JobStateAvailable},
+			}}},
 		})
-		require.EqualError(t, err, "UniqueOpts are not supported for batch inserts")
+		require.EqualError(t, err, "UniqueOpts.ByState must contain all required states, missing: pending, running, scheduled")
 		require.Equal(t, 0, count)
+	})
+}
+
+func Test_Client_InsertManyFastTx(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	type testBundle struct {
+		tx pgx.Tx
+	}
+
+	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
+		t.Helper()
+
+		dbPool := riverinternaltest.TestDB(ctx, t)
+		config := newTestConfig(t, nil)
+		client := newTestClient(t, dbPool, config)
+
+		tx, err := dbPool.Begin(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { tx.Rollback(ctx) })
+
+		return client, &testBundle{
+			tx: tx,
+		}
+	}
+
+	t.Run("SucceedsWithMultipleJobs", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "foo", Priority: 2}},
+			{Args: noOpArgs{}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, count)
+
+		jobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, jobs, 2, "Expected to find exactly two jobs of kind: "+(noOpArgs{}).Kind())
+
+		require.NoError(t, bundle.tx.Commit(ctx))
+
+		// Ensure the jobs are visible outside the transaction:
+		jobs, err = client.driver.GetExecutor().JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, jobs, 2, "Expected to find exactly two jobs of kind: "+(noOpArgs{}).Kind())
+	})
+
+	t.Run("SetsScheduledAtToNowByDefault", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		_, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, nil}})
+		require.NoError(t, err)
+
+		insertedJobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, insertedJobs, 1)
+		require.Equal(t, rivertype.JobStateAvailable, insertedJobs[0].State)
+		require.WithinDuration(t, time.Now(), insertedJobs[0].ScheduledAt, 2*time.Second)
+	})
+
+	t.Run("SupportsScheduledJobs", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		startClient(ctx, t, client)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, &InsertOpts{ScheduledAt: time.Now().Add(time.Minute)}}})
+		require.NoError(t, err)
+		require.Equal(t, 1, count)
+
+		insertedJobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, insertedJobs, 1)
+		require.Equal(t, rivertype.JobStateScheduled, insertedJobs[0].State)
+		require.WithinDuration(t, time.Now().Add(time.Minute), insertedJobs[0].ScheduledAt, 2*time.Second)
+	})
+
+	// A client's allowed to send nil to their driver so they can, for example,
+	// easily use test transactions in their test suite.
+	t.Run("WithDriverWithoutPool", func(t *testing.T) {
+		t.Parallel()
+
+		_, bundle := setup(t)
+
+		client, err := NewClient(riverpgxv5.New(nil), &Config{
+			Logger: riversharedtest.Logger(t),
+		})
+		require.NoError(t, err)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: noOpArgs{}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, 1, count)
+	})
+
+	t.Run("ErrorsWithZeroJobs", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{})
+		require.EqualError(t, err, "no jobs to insert")
+		require.Equal(t, 0, count)
+	})
+
+	t.Run("ErrorsOnUnknownJobKindWithWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: unregisteredJobArgs{}},
+		})
+		var unknownJobKindErr *UnknownJobKindError
+		require.ErrorAs(t, err, &unknownJobKindErr)
+		require.Equal(t, (&unregisteredJobArgs{}).Kind(), unknownJobKindErr.Kind)
+		require.Equal(t, 0, count)
+	})
+
+	t.Run("AllowsUnknownJobKindWithoutWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		client.config.Workers = nil
+
+		_, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: unregisteredJobArgs{}},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("ErrorsOnInsertOptsWithV1UniqueOpts", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		count, err := client.InsertManyFastTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{
+				ByArgs: true,
+				// force the v1 unique path with a custom state list that isn't supported in v3:
+				ByState: []rivertype.JobState{rivertype.JobStateAvailable},
+			}}},
+		})
+		require.EqualError(t, err, "UniqueOpts.ByState must contain all required states, missing: pending, running, scheduled")
+		require.Equal(t, 0, count)
+	})
+}
+
+func Test_Client_InsertMany(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	type testBundle struct {
+		dbPool *pgxpool.Pool
+	}
+
+	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
+		t.Helper()
+
+		dbPool := riverinternaltest.TestDB(ctx, t)
+		config := newTestConfig(t, nil)
+		client := newTestClient(t, dbPool, config)
+
+		return client, &testBundle{dbPool: dbPool}
+	}
+
+	t.Run("SucceedsWithMultipleJobs", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		now := time.Now().UTC()
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: noOpArgs{Name: "Foo"}, InsertOpts: &InsertOpts{Metadata: []byte(`{"a": "b"}`), Queue: "foo", Priority: 2}},
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{ScheduledAt: now.Add(time.Minute)}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+
+		require.False(t, results[0].UniqueSkippedAsDuplicate)
+		require.Equal(t, 0, results[0].Job.Attempt)
+		require.Nil(t, results[0].Job.AttemptedAt)
+		require.WithinDuration(t, now, results[0].Job.CreatedAt, 2*time.Second)
+		require.Empty(t, results[0].Job.AttemptedBy)
+		require.Positive(t, results[0].Job.ID)
+		require.JSONEq(t, `{"name": "Foo"}`, string(results[0].Job.EncodedArgs))
+		require.Empty(t, results[0].Job.Errors)
+		require.Nil(t, results[0].Job.FinalizedAt)
+		require.Equal(t, "noOp", results[0].Job.Kind)
+		require.Equal(t, 25, results[0].Job.MaxAttempts)
+		require.JSONEq(t, `{"a": "b"}`, string(results[0].Job.Metadata))
+		require.Equal(t, 2, results[0].Job.Priority)
+		require.Equal(t, "foo", results[0].Job.Queue)
+		require.WithinDuration(t, now, results[0].Job.ScheduledAt, 2*time.Second)
+		require.Equal(t, rivertype.JobStateAvailable, results[0].Job.State)
+		require.Empty(t, results[0].Job.Tags)
+		require.Empty(t, results[0].Job.UniqueKey)
+
+		require.False(t, results[1].UniqueSkippedAsDuplicate)
+		require.Equal(t, 0, results[1].Job.Attempt)
+		require.Nil(t, results[1].Job.AttemptedAt)
+		require.WithinDuration(t, now, results[1].Job.CreatedAt, 2*time.Second)
+		require.Empty(t, results[1].Job.AttemptedBy)
+		require.Positive(t, results[1].Job.ID)
+		require.JSONEq(t, `{"name": ""}`, string(results[1].Job.EncodedArgs))
+		require.Empty(t, results[1].Job.Errors)
+		require.Nil(t, results[1].Job.FinalizedAt)
+		require.Equal(t, "noOp", results[1].Job.Kind)
+		require.Equal(t, 25, results[1].Job.MaxAttempts)
+		require.JSONEq(t, `{}`, string(results[1].Job.Metadata))
+		require.Equal(t, 1, results[1].Job.Priority)
+		require.Equal(t, "default", results[1].Job.Queue)
+		require.WithinDuration(t, now.Add(time.Minute), results[1].Job.ScheduledAt, time.Millisecond)
+		require.Equal(t, rivertype.JobStateScheduled, results[1].Job.State)
+		require.Empty(t, results[1].Job.Tags)
+		require.Empty(t, results[1].Job.UniqueKey)
+
+		require.NotEqual(t, results[0].Job.ID, results[1].Job.ID)
+
+		jobs, err := client.driver.GetExecutor().JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, jobs, 2, "Expected to find exactly two jobs of kind: "+(noOpArgs{}).Kind())
+	})
+
+	t.Run("TriggersImmediateWork", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		_, bundle := setup(t)
+
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		t.Cleanup(cancel)
+
+		doneCh := make(chan struct{})
+		close(doneCh) // don't need to block any jobs from completing
+		startedCh := make(chan int64)
+
+		config := newTestConfig(t, makeAwaitCallback(startedCh, doneCh))
+		config.FetchCooldown = 20 * time.Millisecond
+		config.FetchPollInterval = 20 * time.Second // essentially disable polling
+		config.Queues = map[string]QueueConfig{QueueDefault: {MaxWorkers: 2}, "another_queue": {MaxWorkers: 1}}
+
+		client := newTestClient(t, bundle.dbPool, config)
+
+		startClient(ctx, t, client)
+		riversharedtest.WaitOrTimeout(t, client.baseStartStop.Started())
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: callbackArgs{}},
+			{Args: callbackArgs{}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+
+		// Wait for the client to be ready by waiting for a job to be executed:
+		riversharedtest.WaitOrTimeoutN(t, startedCh, 2)
+
+		// Now that we've run one job, we shouldn't take longer than the cooldown to
+		// fetch another after insertion. LISTEN/NOTIFY should ensure we find out
+		// about the inserted job much faster than the poll interval.
+		//
+		// Note: we specifically use a different queue to ensure that the notify
+		// limiter is immediately to fire on this queue.
+		results, err = client.InsertMany(ctx, []InsertManyParams{
+			{Args: callbackArgs{}, InsertOpts: &InsertOpts{Queue: "another_queue"}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+
+		select {
+		case <-startedCh:
+		// As long as this is meaningfully shorter than the poll interval, we can be
+		// sure the re-fetch came from listen/notify.
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for another_queue job to start")
+		}
+
+		require.NoError(t, client.Stop(ctx))
+	})
+
+	t.Run("DoesNotTriggerInsertNotificationForNonAvailableJob", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+
+		_, bundle := setup(t)
+
+		config := newTestConfig(t, nil)
+		config.FetchCooldown = 5 * time.Second
+		config.FetchPollInterval = 5 * time.Second
+		client := newTestClient(t, bundle.dbPool, config)
+
+		startClient(ctx, t, client)
+		riversharedtest.WaitOrTimeout(t, client.baseStartStop.Started())
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "a", ScheduledAt: time.Now().Add(1 * time.Hour)}},
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "b"}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+
+		// Queue `a` should be "due" to be triggered because it wasn't triggered above.
+		require.True(t, client.insertNotifyLimiter.ShouldTrigger("a"))
+		// Queue `b` should *not* be "due" to be triggered because it was triggered above.
+		require.False(t, client.insertNotifyLimiter.ShouldTrigger("b"))
+
+		require.NoError(t, client.Stop(ctx))
+	})
+
+	t.Run("WithInsertOptsScheduledAtZeroTime", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: &noOpArgs{}, InsertOpts: &InsertOpts{ScheduledAt: time.Time{}}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+
+		jobs, err := client.driver.GetExecutor().JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1, "Expected to find exactly one job of kind: "+(noOpArgs{}).Kind())
+		jobRow := jobs[0]
+		require.WithinDuration(t, time.Now(), jobRow.ScheduledAt, 2*time.Second)
+	})
+
+	t.Run("ErrorsOnInvalidQueueName", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: &noOpArgs{}, InsertOpts: &InsertOpts{Queue: "invalid*queue"}},
+		})
+		require.ErrorContains(t, err, "queue name is invalid")
+		require.Nil(t, results)
+	})
+
+	t.Run("ErrorsOnDriverWithoutPool", func(t *testing.T) {
+		t.Parallel()
+
+		_, _ = setup(t)
+
+		client, err := NewClient(riverpgxv5.New(nil), &Config{
+			Logger: riversharedtest.Logger(t),
+		})
+		require.NoError(t, err)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: noOpArgs{}},
+		})
+		require.ErrorIs(t, err, errNoDriverDBPool)
+		require.Nil(t, results)
+	})
+
+	t.Run("ErrorsWithZeroJobs", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{})
+		require.EqualError(t, err, "no jobs to insert")
+		require.Nil(t, results)
+	})
+
+	t.Run("ErrorsOnUnknownJobKindWithWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: unregisteredJobArgs{}},
+		})
+		var unknownJobKindErr *UnknownJobKindError
+		require.ErrorAs(t, err, &unknownJobKindErr)
+		require.Equal(t, (&unregisteredJobArgs{}).Kind(), unknownJobKindErr.Kind)
+		require.Nil(t, results)
+	})
+
+	t.Run("AllowsUnknownJobKindWithoutWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		client.config.Workers = nil
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: unregisteredJobArgs{}},
+		})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+	})
+
+	t.Run("ErrorsOnInsertOptsWithV1UniqueOpts", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		results, err := client.InsertMany(ctx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{
+				ByArgs: true,
+				// force the v1 unique path with a custom state list that isn't supported in v3:
+				ByState: []rivertype.JobState{rivertype.JobStateAvailable},
+			}}},
+		})
+		require.EqualError(t, err, "UniqueOpts.ByState must contain all required states, missing: pending, running, scheduled")
+		require.Empty(t, results)
 	})
 }
 
@@ -1804,21 +2426,56 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		client, bundle := setup(t)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
-			{Args: noOpArgs{}, InsertOpts: &InsertOpts{Queue: "foo", Priority: 2}},
-			{Args: noOpArgs{}},
+		now := time.Now().UTC()
+
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: noOpArgs{Name: "Foo"}, InsertOpts: &InsertOpts{Metadata: []byte(`{"a": "b"}`), Queue: "foo", Priority: 2}},
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{ScheduledAt: now.Add(time.Minute)}},
 		})
 		require.NoError(t, err)
-		require.Equal(t, 2, count)
+		require.Len(t, results, 2)
+
+		require.False(t, results[0].UniqueSkippedAsDuplicate)
+		require.Equal(t, 0, results[0].Job.Attempt)
+		require.Nil(t, results[0].Job.AttemptedAt)
+		require.WithinDuration(t, now, results[0].Job.CreatedAt, 2*time.Second)
+		require.Empty(t, results[0].Job.AttemptedBy)
+		require.Positive(t, results[0].Job.ID)
+		require.JSONEq(t, `{"name": "Foo"}`, string(results[0].Job.EncodedArgs))
+		require.Empty(t, results[0].Job.Errors)
+		require.Nil(t, results[0].Job.FinalizedAt)
+		require.Equal(t, "noOp", results[0].Job.Kind)
+		require.Equal(t, 25, results[0].Job.MaxAttempts)
+		require.JSONEq(t, `{"a": "b"}`, string(results[0].Job.Metadata))
+		require.Equal(t, 2, results[0].Job.Priority)
+		require.Equal(t, "foo", results[0].Job.Queue)
+		require.WithinDuration(t, now, results[0].Job.ScheduledAt, 2*time.Second)
+		require.Equal(t, rivertype.JobStateAvailable, results[0].Job.State)
+		require.Empty(t, results[0].Job.Tags)
+		require.Empty(t, results[0].Job.UniqueKey)
+
+		require.False(t, results[1].UniqueSkippedAsDuplicate)
+		require.Equal(t, 0, results[1].Job.Attempt)
+		require.Nil(t, results[1].Job.AttemptedAt)
+		require.WithinDuration(t, now, results[1].Job.CreatedAt, 2*time.Second)
+		require.Empty(t, results[1].Job.AttemptedBy)
+		require.Positive(t, results[1].Job.ID)
+		require.JSONEq(t, `{"name": ""}`, string(results[1].Job.EncodedArgs))
+		require.Empty(t, results[1].Job.Errors)
+		require.Nil(t, results[1].Job.FinalizedAt)
+		require.Equal(t, "noOp", results[1].Job.Kind)
+		require.Equal(t, 25, results[1].Job.MaxAttempts)
+		require.JSONEq(t, `{}`, string(results[1].Job.Metadata))
+		require.Equal(t, 1, results[1].Job.Priority)
+		require.Equal(t, "default", results[1].Job.Queue)
+		require.WithinDuration(t, now.Add(time.Minute), results[1].Job.ScheduledAt, time.Millisecond)
+		require.Equal(t, rivertype.JobStateScheduled, results[1].Job.State)
+		require.Empty(t, results[1].Job.Tags)
+		require.Empty(t, results[1].Job.UniqueKey)
+
+		require.NotEqual(t, results[0].Job.ID, results[1].Job.ID)
 
 		jobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
-		require.NoError(t, err)
-		require.Len(t, jobs, 2, "Expected to find exactly two jobs of kind: "+(noOpArgs{}).Kind())
-
-		require.NoError(t, bundle.tx.Commit(ctx))
-
-		// Ensure the jobs are visible outside the transaction:
-		jobs, err = client.driver.GetExecutor().JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
 		require.NoError(t, err)
 		require.Len(t, jobs, 2, "Expected to find exactly two jobs of kind: "+(noOpArgs{}).Kind())
 	})
@@ -1828,8 +2485,12 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		client, bundle := setup(t)
 
-		_, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, nil}})
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, nil}})
 		require.NoError(t, err)
+		require.Len(t, results, 1)
+
+		require.Equal(t, rivertype.JobStateAvailable, results[0].Job.State)
+		require.WithinDuration(t, time.Now(), results[0].Job.ScheduledAt, 2*time.Second)
 
 		insertedJobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
 		require.NoError(t, err)
@@ -1845,15 +2506,12 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		startClient(ctx, t, client)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, &InsertOpts{ScheduledAt: time.Now().Add(time.Minute)}}})
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{noOpArgs{}, &InsertOpts{ScheduledAt: time.Now().Add(time.Minute)}}})
 		require.NoError(t, err)
-		require.Equal(t, 1, count)
+		require.Len(t, results, 1)
 
-		insertedJobs, err := client.driver.UnwrapExecutor(bundle.tx).JobGetByKindMany(ctx, []string{(noOpArgs{}).Kind()})
-		require.NoError(t, err)
-		require.Len(t, insertedJobs, 1)
-		require.Equal(t, rivertype.JobStateScheduled, insertedJobs[0].State)
-		require.WithinDuration(t, time.Now().Add(time.Minute), insertedJobs[0].ScheduledAt, 2*time.Second)
+		require.Equal(t, rivertype.JobStateScheduled, results[0].Job.State)
+		require.WithinDuration(t, time.Now().Add(time.Minute), results[0].Job.ScheduledAt, 2*time.Second)
 	})
 
 	// A client's allowed to send nil to their driver so they can, for example,
@@ -1868,11 +2526,76 @@ func Test_Client_InsertManyTx(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
 			{Args: noOpArgs{}},
 		})
 		require.NoError(t, err)
-		require.Equal(t, 1, count)
+		require.Len(t, results, 1)
+	})
+
+	t.Run("WithJobInsertMiddleware", func(t *testing.T) {
+		t.Parallel()
+
+		_, bundle := setup(t)
+		config := newTestConfig(t, nil)
+		config.Queues = nil
+
+		insertCalled := false
+		var innerResults []*rivertype.JobInsertResult
+
+		middleware := &overridableJobMiddleware{
+			insertManyFunc: func(ctx context.Context, manyParams []*rivertype.JobInsertParams, doInner func(ctx context.Context) ([]*rivertype.JobInsertResult, error)) ([]*rivertype.JobInsertResult, error) {
+				insertCalled = true
+				var err error
+				for _, params := range manyParams {
+					params.Metadata, err = sjson.SetBytes(params.Metadata, "middleware", "called")
+					require.NoError(t, err)
+				}
+
+				results, err := doInner(ctx)
+				require.NoError(t, err)
+				innerResults = results
+				return results, nil
+			},
+		}
+
+		config.JobInsertMiddleware = []rivertype.JobInsertMiddleware{middleware}
+		driver := riverpgxv5.New(nil)
+		client, err := NewClient(driver, config)
+		require.NoError(t, err)
+
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{Args: noOpArgs{}}})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+
+		require.True(t, insertCalled)
+		require.Len(t, innerResults, 1)
+		require.Len(t, results, 1)
+		require.Equal(t, innerResults[0].Job.ID, results[0].Job.ID)
+		require.JSONEq(t, `{"middleware": "called"}`, string(results[0].Job.Metadata))
+	})
+
+	t.Run("WithUniqueOpts", func(t *testing.T) {
+		t.Parallel()
+
+		client, bundle := setup(t)
+
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{Args: noOpArgs{Name: "foo"}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}}}})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		job1 := results[0]
+
+		// Dupe, same args:
+		results, err = client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{Args: noOpArgs{Name: "foo"}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}}}})
+		require.NoError(t, err)
+		job2 := results[0]
+		require.Equal(t, job1.Job.ID, job2.Job.ID)
+
+		// Not a dupe, different args
+		results, err = client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{{Args: noOpArgs{Name: "bar"}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}}}})
+		require.NoError(t, err)
+		job3 := results[0]
+		require.NotEqual(t, job1.Job.ID, job3.Job.ID)
 	})
 
 	t.Run("ErrorsWithZeroJobs", func(t *testing.T) {
@@ -1880,9 +2603,9 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		client, bundle := setup(t)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{})
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{})
 		require.EqualError(t, err, "no jobs to insert")
-		require.Equal(t, 0, count)
+		require.Nil(t, results)
 	})
 
 	t.Run("ErrorsOnUnknownJobKindWithWorkers", func(t *testing.T) {
@@ -1890,13 +2613,13 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		client, bundle := setup(t)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
 			{Args: unregisteredJobArgs{}},
 		})
 		var unknownJobKindErr *UnknownJobKindError
 		require.ErrorAs(t, err, &unknownJobKindErr)
 		require.Equal(t, (&unregisteredJobArgs{}).Kind(), unknownJobKindErr.Kind)
-		require.Equal(t, 0, count)
+		require.Nil(t, results)
 	})
 
 	t.Run("AllowsUnknownJobKindWithoutWorkers", func(t *testing.T) {
@@ -1906,22 +2629,27 @@ func Test_Client_InsertManyTx(t *testing.T) {
 
 		client.config.Workers = nil
 
-		_, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
 			{Args: unregisteredJobArgs{}},
 		})
 		require.NoError(t, err)
+		require.Len(t, results, 1)
 	})
 
-	t.Run("ErrorsOnInsertOptsUniqueOpts", func(t *testing.T) {
+	t.Run("ErrorsOnInsertOptsWithV1UniqueOpts", func(t *testing.T) {
 		t.Parallel()
 
 		client, bundle := setup(t)
 
-		count, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
-			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{ByArgs: true}}},
+		results, err := client.InsertManyTx(ctx, bundle.tx, []InsertManyParams{
+			{Args: noOpArgs{}, InsertOpts: &InsertOpts{UniqueOpts: UniqueOpts{
+				ByArgs: true,
+				// force the v1 unique path with a custom state list that isn't supported in v3:
+				ByState: []rivertype.JobState{rivertype.JobStateAvailable},
+			}}},
 		})
-		require.EqualError(t, err, "UniqueOpts are not supported for batch inserts")
-		require.Equal(t, 0, count)
+		require.EqualError(t, err, "UniqueOpts.ByState must contain all required states, missing: pending, running, scheduled")
+		require.Empty(t, results)
 	})
 }
 
@@ -2423,9 +3151,9 @@ func Test_Client_ErrorHandler(t *testing.T) {
 
 		// Bypass the normal Insert function because that will error on an
 		// unknown job.
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(&client.baseService.Archetype, config, unregisteredJobArgs{}, nil)
+		insertParams, err := insertParamsFromConfigArgsAndOptions(&client.baseService.Archetype, config, unregisteredJobArgs{}, nil)
 		require.NoError(t, err)
-		_, err = client.driver.GetExecutor().JobInsertFast(ctx, insertParams)
+		_, err = client.driver.GetExecutor().JobInsertFastMany(ctx, []*riverdriver.JobInsertFastParams{(*riverdriver.JobInsertFastParams)(insertParams)})
 		require.NoError(t, err)
 
 		riversharedtest.WaitOrTimeout(t, bundle.SubscribeChan)
@@ -2714,6 +3442,33 @@ func Test_Client_Maintenance(t *testing.T) {
 		require.Empty(t, jobs)
 	})
 
+	t.Run("PeriodicJobConstructorReturningNil", func(t *testing.T) {
+		t.Parallel()
+
+		config := newTestConfig(t, nil)
+
+		worker := &periodicJobWorker{}
+		AddWorker(config.Workers, worker)
+		config.PeriodicJobs = []*PeriodicJob{
+			NewPeriodicJob(cron.Every(15*time.Minute), func() (JobArgs, *InsertOpts) {
+				// Returning nil from the constructor function should not insert a new
+				// job and should be handled cleanly
+				return nil, nil
+			}, &PeriodicJobOpts{RunOnStart: true}),
+		}
+
+		client, bundle := setup(t, config)
+
+		startAndWaitForQueueMaintainer(ctx, t, client)
+
+		svc := maintenance.GetService[*maintenance.PeriodicJobEnqueuer](client.queueMaintainer)
+		svc.TestSignals.SkippedJob.WaitOrTimeout()
+
+		jobs, err := bundle.exec.JobGetByKindMany(ctx, []string{(periodicJobArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Empty(t, jobs, "Expected to find zero jobs of kind: "+(periodicJobArgs{}).Kind())
+	})
+
 	t.Run("PeriodicJobEnqueuerAddDynamically", func(t *testing.T) {
 		t.Parallel()
 
@@ -2802,6 +3557,39 @@ func Test_Client_Maintenance(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
 		}
+	})
+
+	t.Run("PeriodicJobEnqueuerUsesMiddleware", func(t *testing.T) {
+		t.Parallel()
+
+		config := newTestConfig(t, nil)
+
+		worker := &periodicJobWorker{}
+		AddWorker(config.Workers, worker)
+		config.PeriodicJobs = []*PeriodicJob{
+			NewPeriodicJob(cron.Every(time.Minute), func() (JobArgs, *InsertOpts) {
+				return periodicJobArgs{}, nil
+			}, &PeriodicJobOpts{RunOnStart: true}),
+		}
+		config.JobInsertMiddleware = []rivertype.JobInsertMiddleware{&overridableJobMiddleware{
+			insertManyFunc: func(ctx context.Context, manyParams []*rivertype.JobInsertParams, doInner func(ctx context.Context) ([]*rivertype.JobInsertResult, error)) ([]*rivertype.JobInsertResult, error) {
+				for _, job := range manyParams {
+					job.EncodedArgs = []byte(`{"from": "middleware"}`)
+				}
+				return doInner(ctx)
+			},
+		}}
+
+		client, bundle := setup(t, config)
+
+		startAndWaitForQueueMaintainer(ctx, t, client)
+
+		svc := maintenance.GetService[*maintenance.PeriodicJobEnqueuer](client.queueMaintainer)
+		svc.TestSignals.InsertedJobs.WaitOrTimeout()
+
+		jobs, err := bundle.exec.JobGetByKindMany(ctx, []string{(periodicJobArgs{}).Kind()})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1, "Expected to find exactly one job of kind: "+(periodicJobArgs{}).Kind())
 	})
 
 	t.Run("QueueCleaner", func(t *testing.T) {
@@ -3403,6 +4191,19 @@ func Test_Client_Subscribe(t *testing.T) {
 
 		require.Empty(t, client.subscriptionManager.subscriptions)
 	})
+
+	// Just make sure this doesn't fail on a nil pointer exception.
+	t.Run("SubscribeOnClientWithoutWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		dbPool := riverinternaltest.TestDB(ctx, t)
+
+		client := newTestClient(t, dbPool, &Config{})
+
+		require.PanicsWithValue(t, "created a subscription on a client that will never work jobs (Workers not configured)", func() {
+			_, _ = client.Subscribe(EventKindJobCompleted)
+		})
+	})
 }
 
 // SubscribeConfig uses all the same code as Subscribe, so these are just a
@@ -3544,6 +4345,7 @@ func Test_Client_SubscribeConfig(t *testing.T) {
 		)
 		for i := 0; i < numJobsToInsert; i++ {
 			insertParams[i] = &riverdriver.JobInsertFastParams{
+				Args:        &JobArgs{},
 				EncodedArgs: []byte(`{}`),
 				Kind:        kind,
 				MaxAttempts: rivercommon.MaxAttemptsDefault,
@@ -3984,19 +4786,21 @@ func Test_Client_UnknownJobKindErrorsTheJob(t *testing.T) {
 	subscribeChan, cancel := client.Subscribe(EventKindJobFailed)
 	t.Cleanup(cancel)
 
-	insertParams, _, err := insertParamsFromConfigArgsAndOptions(&client.baseService.Archetype, config, unregisteredJobArgs{}, nil)
+	insertParams, err := insertParamsFromConfigArgsAndOptions(&client.baseService.Archetype, config, unregisteredJobArgs{}, nil)
 	require.NoError(err)
-	insertedJob, err := client.driver.GetExecutor().JobInsertFast(ctx, insertParams)
+	insertedResults, err := client.driver.GetExecutor().JobInsertFastMany(ctx, []*riverdriver.JobInsertFastParams{(*riverdriver.JobInsertFastParams)(insertParams)})
 	require.NoError(err)
 
+	insertedResult := insertedResults[0]
+
 	event := riversharedtest.WaitOrTimeout(t, subscribeChan)
-	require.Equal(insertedJob.ID, event.Job.ID)
-	require.Equal("RandomWorkerNameThatIsNeverRegistered", insertedJob.Kind)
+	require.Equal(insertedResult.Job.ID, event.Job.ID)
+	require.Equal("RandomWorkerNameThatIsNeverRegistered", insertedResult.Job.Kind)
 	require.Len(event.Job.Errors, 1)
 	require.Equal((&UnknownJobKindError{Kind: "RandomWorkerNameThatIsNeverRegistered"}).Error(), event.Job.Errors[0].Error)
 	require.Equal(rivertype.JobStateRetryable, event.Job.State)
 	// Ensure that ScheduledAt was updated with next run time:
-	require.True(event.Job.ScheduledAt.After(insertedJob.ScheduledAt))
+	require.True(event.Job.ScheduledAt.After(insertedResult.Job.ScheduledAt))
 	// It's the 1st attempt that failed. Attempt won't be incremented again until
 	// the job gets fetched a 2nd time.
 	require.Equal(1, event.Job.Attempt)
@@ -4118,12 +4922,13 @@ func Test_NewClient_Defaults(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Zero(t, client.uniqueInserter.AdvisoryLockPrefix)
+	require.Zero(t, client.config.AdvisoryLockPrefix)
 
 	jobCleaner := maintenance.GetService[*maintenance.JobCleaner](client.queueMaintainer)
 	require.Equal(t, maintenance.CancelledJobRetentionPeriodDefault, jobCleaner.Config.CancelledJobRetentionPeriod)
 	require.Equal(t, maintenance.CompletedJobRetentionPeriodDefault, jobCleaner.Config.CompletedJobRetentionPeriod)
 	require.Equal(t, maintenance.DiscardedJobRetentionPeriodDefault, jobCleaner.Config.DiscardedJobRetentionPeriod)
+	require.Equal(t, maintenance.JobCleanerTimeoutDefault, jobCleaner.Config.Timeout)
 	require.False(t, jobCleaner.StaggerStartupIsDisabled())
 
 	enqueuer := maintenance.GetService[*maintenance.PeriodicJobEnqueuer](client.queueMaintainer)
@@ -4153,6 +4958,14 @@ func Test_NewClient_Overrides(t *testing.T) {
 
 	retryPolicy := &DefaultClientRetryPolicy{}
 
+	type noOpInsertMiddleware struct {
+		JobInsertMiddlewareDefaults
+	}
+
+	type noOpWorkerMiddleware struct {
+		WorkerMiddlewareDefaults
+	}
+
 	client, err := NewClient(riverpgxv5.New(dbPool), &Config{
 		AdvisoryLockPrefix:          123_456,
 		CancelledJobRetentionPeriod: 1 * time.Hour,
@@ -4161,6 +4974,7 @@ func Test_NewClient_Overrides(t *testing.T) {
 		ErrorHandler:                errorHandler,
 		FetchCooldown:               123 * time.Millisecond,
 		FetchPollInterval:           124 * time.Millisecond,
+		JobInsertMiddleware:         []rivertype.JobInsertMiddleware{&noOpInsertMiddleware{}},
 		JobTimeout:                  125 * time.Millisecond,
 		Logger:                      logger,
 		MaxAttempts:                 5,
@@ -4168,10 +4982,11 @@ func Test_NewClient_Overrides(t *testing.T) {
 		RetryPolicy:                 retryPolicy,
 		TestOnly:                    true, // disables staggered start in maintenance services
 		Workers:                     workers,
+		WorkerMiddleware:            []rivertype.WorkerMiddleware{&noOpWorkerMiddleware{}},
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, int32(123_456), client.uniqueInserter.AdvisoryLockPrefix)
+	require.Equal(t, int32(123_456), client.config.AdvisoryLockPrefix)
 
 	jobCleaner := maintenance.GetService[*maintenance.JobCleaner](client.queueMaintainer)
 	require.Equal(t, 1*time.Hour, jobCleaner.Config.CancelledJobRetentionPeriod)
@@ -4186,10 +5001,12 @@ func Test_NewClient_Overrides(t *testing.T) {
 	require.Equal(t, errorHandler, client.config.ErrorHandler)
 	require.Equal(t, 123*time.Millisecond, client.config.FetchCooldown)
 	require.Equal(t, 124*time.Millisecond, client.config.FetchPollInterval)
+	require.Len(t, client.config.JobInsertMiddleware, 1)
 	require.Equal(t, 125*time.Millisecond, client.config.JobTimeout)
 	require.Equal(t, logger, client.baseService.Logger)
 	require.Equal(t, 5, client.config.MaxAttempts)
 	require.Equal(t, retryPolicy, client.config.RetryPolicy)
+	require.Len(t, client.config.WorkerMiddleware, 1)
 }
 
 func Test_NewClient_MissingParameters(t *testing.T) {
@@ -4576,6 +5393,14 @@ func TestClient_JobTimeout(t *testing.T) {
 	}
 }
 
+type JobArgsStaticKind struct {
+	kind string
+}
+
+func (a JobArgsStaticKind) Kind() string {
+	return a.kind
+}
+
 func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 	t.Parallel()
 
@@ -4585,7 +5410,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 	t.Run("Defaults", func(t *testing.T) {
 		t.Parallel()
 
-		insertParams, uniqueOpts, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, nil)
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, nil)
 		require.NoError(t, err)
 		require.Equal(t, `{"name":""}`, string(insertParams.EncodedArgs))
 		require.Equal(t, (noOpArgs{}).Kind(), insertParams.Kind)
@@ -4594,8 +5419,8 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 		require.Equal(t, QueueDefault, insertParams.Queue)
 		require.Nil(t, insertParams.ScheduledAt)
 		require.Equal(t, []string{}, insertParams.Tags)
-
-		require.True(t, uniqueOpts.IsEmpty())
+		require.Empty(t, insertParams.UniqueKey)
+		require.Zero(t, insertParams.UniqueStates)
 	})
 
 	t.Run("ConfigOverrides", func(t *testing.T) {
@@ -4605,7 +5430,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 			MaxAttempts: 34,
 		}
 
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, overrideConfig, noOpArgs{}, nil)
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, overrideConfig, noOpArgs{}, nil)
 		require.NoError(t, err)
 		require.Equal(t, overrideConfig.MaxAttempts, insertParams.MaxAttempts)
 	})
@@ -4620,7 +5445,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 			ScheduledAt: time.Now().Add(time.Hour),
 			Tags:        []string{"tag1", "tag2"},
 		}
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, opts)
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, opts)
 		require.NoError(t, err)
 		require.Equal(t, 42, insertParams.MaxAttempts)
 		require.Equal(t, 2, insertParams.Priority)
@@ -4634,7 +5459,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 
 		nearFuture := time.Now().Add(5 * time.Minute)
 
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{
 			ScheduledAt: nearFuture,
 		}, nil)
 		require.NoError(t, err)
@@ -4650,7 +5475,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 	t.Run("WorkerInsertOptsScheduledAtNotRespectedIfZero", func(t *testing.T) {
 		t.Parallel()
 
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{
 			ScheduledAt: time.Time{},
 		}, nil)
 		require.NoError(t, err)
@@ -4661,42 +5486,132 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 		t.Parallel()
 
 		{
-			_, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{}, &InsertOpts{
+			_, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{}, &InsertOpts{
 				Tags: []string{strings.Repeat("h", 256)},
 			})
 			require.EqualError(t, err, "tags should be a maximum of 255 characters long")
 		}
 
 		{
-			_, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{}, &InsertOpts{
+			_, err := insertParamsFromConfigArgsAndOptions(archetype, config, &customInsertOptsJobArgs{}, &InsertOpts{
 				Tags: []string{"tag,with,comma"},
 			})
 			require.EqualError(t, err, "tags should match regex "+tagRE.String())
 		}
 	})
 
-	t.Run("UniqueOpts", func(t *testing.T) {
+	t.Run("UniqueOptsDefaultStates", func(t *testing.T) {
 		t.Parallel()
 
+		archetype := riversharedtest.BaseServiceArchetype(t)
+		archetype.Time.StubNowUTC(time.Now().UTC())
+
 		uniqueOpts := UniqueOpts{
-			ByArgs:   true,
-			ByPeriod: 10 * time.Second,
-			ByQueue:  true,
-			ByState:  []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted},
+			ByArgs:      true,
+			ByPeriod:    10 * time.Second,
+			ByQueue:     true,
+			ExcludeKind: true,
 		}
 
-		_, internalUniqueOpts, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, &InsertOpts{UniqueOpts: uniqueOpts})
+		params, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, &InsertOpts{UniqueOpts: uniqueOpts})
 		require.NoError(t, err)
-		require.Equal(t, uniqueOpts.ByArgs, internalUniqueOpts.ByArgs)
-		require.Equal(t, uniqueOpts.ByPeriod, internalUniqueOpts.ByPeriod)
-		require.Equal(t, uniqueOpts.ByQueue, internalUniqueOpts.ByQueue)
-		require.Equal(t, uniqueOpts.ByState, internalUniqueOpts.ByState)
+		internalUniqueOpts := &dbunique.UniqueOpts{
+			ByArgs:      true,
+			ByPeriod:    10 * time.Second,
+			ByQueue:     true,
+			ByState:     []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled},
+			ExcludeKind: true,
+		}
+
+		expectedKey, err := dbunique.UniqueKey(archetype.Time, internalUniqueOpts, params)
+		require.NoError(t, err)
+
+		require.Equal(t, expectedKey, params.UniqueKey)
+		require.Equal(t, internalUniqueOpts.StateBitmask(), params.UniqueStates)
+	})
+
+	t.Run("UniqueOptsCustomStates", func(t *testing.T) {
+		t.Parallel()
+
+		archetype := riversharedtest.BaseServiceArchetype(t)
+		archetype.Time.StubNowUTC(time.Now().UTC())
+
+		states := []rivertype.JobState{
+			rivertype.JobStateAvailable,
+			rivertype.JobStatePending,
+			rivertype.JobStateRetryable,
+			rivertype.JobStateRunning,
+			rivertype.JobStateScheduled,
+		}
+
+		uniqueOpts := UniqueOpts{
+			ByPeriod: 10 * time.Second,
+			ByQueue:  true,
+			ByState:  states,
+		}
+
+		params, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, &InsertOpts{UniqueOpts: uniqueOpts})
+		require.NoError(t, err)
+		internalUniqueOpts := &dbunique.UniqueOpts{
+			ByPeriod: 10 * time.Second,
+			ByQueue:  true,
+			ByState:  states,
+		}
+
+		expectedKey, err := dbunique.UniqueKey(archetype.Time, internalUniqueOpts, params)
+		require.NoError(t, err)
+
+		require.Equal(t, expectedKey, params.UniqueKey)
+		require.Equal(t, internalUniqueOpts.StateBitmask(), params.UniqueStates)
+	})
+
+	t.Run("UniqueOptsWithPartialArgs", func(t *testing.T) {
+		t.Parallel()
+
+		uniqueOpts := UniqueOpts{ByArgs: true}
+
+		type PartialArgs struct {
+			JobArgsStaticKind
+			Included bool `json:"included" river:"unique"`
+			Excluded bool `json:"excluded"`
+		}
+
+		args := PartialArgs{
+			JobArgsStaticKind: JobArgsStaticKind{kind: "partialArgs"},
+			Included:          true,
+			Excluded:          true,
+		}
+
+		params, err := insertParamsFromConfigArgsAndOptions(archetype, config, args, &InsertOpts{UniqueOpts: uniqueOpts})
+		require.NoError(t, err)
+		internalUniqueOpts := &dbunique.UniqueOpts{ByArgs: true}
+
+		expectedKey, err := dbunique.UniqueKey(archetype.Time, internalUniqueOpts, params)
+		require.NoError(t, err)
+		require.Equal(t, expectedKey, params.UniqueKey)
+		require.Equal(t, internalUniqueOpts.StateBitmask(), params.UniqueStates)
+
+		argsWithExcludedFalse := PartialArgs{
+			JobArgsStaticKind: JobArgsStaticKind{kind: "partialArgs"},
+			Included:          true,
+			Excluded:          false,
+		}
+
+		params2, err := insertParamsFromConfigArgsAndOptions(archetype, config, argsWithExcludedFalse, &InsertOpts{UniqueOpts: uniqueOpts})
+		require.NoError(t, err)
+		internalUniqueOpts2 := &dbunique.UniqueOpts{ByArgs: true}
+
+		expectedKey2, err := dbunique.UniqueKey(archetype.Time, internalUniqueOpts2, params2)
+		require.NoError(t, err)
+		require.Equal(t, expectedKey2, params2.UniqueKey)
+		require.Equal(t, internalUniqueOpts2.StateBitmask(), params.UniqueStates)
+		require.Equal(t, params.UniqueKey, params2.UniqueKey, "unique keys should be identical because included args are the same, even though others differ")
 	})
 
 	t.Run("PriorityIsLimitedTo4", func(t *testing.T) {
 		t.Parallel()
 
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, &InsertOpts{Priority: 5})
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, noOpArgs{}, &InsertOpts{Priority: 5})
 		require.ErrorContains(t, err, "priority must be between 1 and 4")
 		require.Nil(t, insertParams)
 	})
@@ -4705,7 +5620,7 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 		t.Parallel()
 
 		args := timeoutTestArgs{TimeoutValue: time.Hour}
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(archetype, config, args, nil)
+		insertParams, err := insertParamsFromConfigArgsAndOptions(archetype, config, args, nil)
 		require.NoError(t, err)
 		require.Equal(t, `{"timeout_value":3600000000000}`, string(insertParams.EncodedArgs))
 	})
@@ -4716,13 +5631,13 @@ func TestInsertParamsFromJobArgsAndOptions(t *testing.T) {
 		// Ensure that unique opts are validated. No need to be exhaustive here
 		// since we already have tests elsewhere for that. Just make sure validation
 		// is running.
-		insertParams, _, err := insertParamsFromConfigArgsAndOptions(
+		insertParams, err := insertParamsFromConfigArgsAndOptions(
 			archetype,
 			config,
 			noOpArgs{},
 			&InsertOpts{UniqueOpts: UniqueOpts{ByPeriod: 1 * time.Millisecond}},
 		)
-		require.EqualError(t, err, "JobUniqueOpts.ByPeriod should not be less than 1 second")
+		require.EqualError(t, err, "UniqueOpts.ByPeriod should not be less than 1 second")
 		require.Nil(t, insertParams)
 	})
 }
@@ -4775,9 +5690,8 @@ func TestInsert(t *testing.T) {
 	AddWorker(workers, &noOpWorker{})
 
 	config := &Config{
-		FetchCooldown: 2 * time.Millisecond,
-		Queues:        map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
-		Workers:       workers,
+		Queues:  map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
+		Workers: workers,
 	}
 
 	client, err := NewClient(riverpgxv5.New(dbPool), config)
@@ -4907,7 +5821,7 @@ func TestUniqueOpts(t *testing.T) {
 		// roughly in the middle of the hour and well clear of any period
 		// boundaries.
 		client.baseService.Time.StubNowUTC(
-			time.Now().Truncate(1 * time.Hour).Add(37*time.Minute + 23*time.Second + 123*time.Millisecond),
+			time.Now().Truncate(1 * time.Hour).Add(37*time.Minute + 23*time.Second + 123*time.Millisecond).UTC(),
 		)
 
 		return client, &testBundle{}
@@ -4938,14 +5852,15 @@ func TestUniqueOpts(t *testing.T) {
 		require.Equal(t, insertRes0.Job.ID, insertRes1.Job.ID)
 	})
 
-	t.Run("UniqueByState", func(t *testing.T) {
+	t.Run("UniqueByCustomStates", func(t *testing.T) {
 		t.Parallel()
 
 		client, _ := setup(t)
 
 		uniqueOpts := UniqueOpts{
 			ByPeriod: 24 * time.Hour,
-			ByState:  []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted},
+			ByState:  rivertype.JobStates(),
+			ByQueue:  true,
 		}
 
 		insertRes0, err := client.Insert(ctx, noOpArgs{}, &InsertOpts{
@@ -4958,21 +5873,36 @@ func TestUniqueOpts(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// Expect the same job to come back because the original is either still
-		// `available` or `completed`, both which we deduplicate off of.
+		// Expect the same job to come back because we deduplicate from the original.
 		require.Equal(t, insertRes0.Job.ID, insertRes1.Job.ID)
 
 		insertRes2, err := client.Insert(ctx, noOpArgs{}, &InsertOpts{
-			// Use a scheduled time so the job's inserted in state `scheduled`
-			// instead of `available`.
-			ScheduledAt: time.Now().Add(1 * time.Hour),
-			UniqueOpts:  uniqueOpts,
+			// Use another queue so the job can be inserted:
+			Queue:      "other",
+			UniqueOpts: uniqueOpts,
 		})
 		require.NoError(t, err)
 
 		// This job however is _not_ the same because it's inserted as
 		// `scheduled` which is outside the unique constraints.
 		require.NotEqual(t, insertRes0.Job.ID, insertRes2.Job.ID)
+	})
+
+	t.Run("ErrorsWithUniqueV1CustomStates", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := setup(t)
+
+		uniqueOpts := UniqueOpts{
+			ByPeriod: 24 * time.Hour,
+			ByState:  []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted},
+		}
+
+		insertRes, err := client.Insert(ctx, noOpArgs{}, &InsertOpts{
+			UniqueOpts: uniqueOpts,
+		})
+		require.EqualError(t, err, "UniqueOpts.ByState must contain all required states, missing: pending, running, scheduled")
+		require.Nil(t, insertRes)
 	})
 }
 

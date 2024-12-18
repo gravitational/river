@@ -10,12 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/riverqueue/river/internal/riverinternaltest"
-	"github.com/riverqueue/river/internal/riverinternaltest/testfactory"
 	"github.com/riverqueue/river/internal/workunit"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/startstoptest"
+	"github.com/riverqueue/river/rivershared/testfactory"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivertype"
@@ -38,10 +38,11 @@ type callbackWorkUnit struct {
 	timeout  time.Duration // defaults to 0, which signals default timeout
 }
 
-func (w *callbackWorkUnit) NextRetry() time.Time           { return time.Now().Add(30 * time.Second) }
-func (w *callbackWorkUnit) Timeout() time.Duration         { return w.timeout }
-func (w *callbackWorkUnit) Work(ctx context.Context) error { return w.callback(ctx, w.jobRow) }
-func (w *callbackWorkUnit) UnmarshalJob() error            { return nil }
+func (w *callbackWorkUnit) Middleware() []rivertype.WorkerMiddleware { return nil }
+func (w *callbackWorkUnit) NextRetry() time.Time                     { return time.Now().Add(30 * time.Second) }
+func (w *callbackWorkUnit) Timeout() time.Duration                   { return w.timeout }
+func (w *callbackWorkUnit) Work(ctx context.Context) error           { return w.callback(ctx, w.jobRow) }
+func (w *callbackWorkUnit) UnmarshalJob() error                      { return nil }
 
 type SimpleClientRetryPolicy struct{}
 

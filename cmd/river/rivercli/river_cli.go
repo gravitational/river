@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -23,7 +24,19 @@ import (
 
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivermigrate"
+	"github.com/riverqueue/river/rivershared/util/valutil"
 )
+
+type Config struct {
+	// DriverProcurer provides a way of procuring drivers for various supported
+	// databases.
+	DriverProcurer DriverProcurer
+
+	// Name is the human-friendly named of the executable, used while showing
+	// version output. Usually this is just "River", but it could be "River
+	// Pro".
+	Name string
+}
 
 // DriverProcurer is an interface that provides a way of procuring drivers for
 // various supported databases.
@@ -34,42 +47,33 @@ type DriverProcurer interface {
 // CLI provides a common base of commands for the River CLI.
 type CLI struct {
 	driverProcurer DriverProcurer
+	name           string
+	out            io.Writer
 }
 
-func NewCLI(driverProcurer DriverProcurer) *CLI {
+func NewCLI(config *Config) *CLI {
 	return &CLI{
-		driverProcurer: driverProcurer,
+		driverProcurer: config.DriverProcurer,
+		name:           config.Name,
+		out:            os.Stdout,
 	}
 }
 
 // BaseCommandSet provides a base River CLI command set which may be further
 // augmented with additional commands.
 func (c *CLI) BaseCommandSet() *cobra.Command {
-	var rootOpts struct {
+	ctx := context.Background()
+
+	var globalOpts struct {
 		Debug   bool
 		Verbose bool
 	}
-	rootCmd := &cobra.Command{
-		Use:   "river",
-		Short: "Provides command line facilities for the River job queue",
-		Long: strings.TrimSpace(`
-Provides command line facilities for the River job queue.
-		`),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Usage()
-		},
-	}
-	rootCmd.PersistentFlags().BoolVar(&rootOpts.Debug, "debug", false, "output maximum logging verbosity (debug level)")
-	rootCmd.PersistentFlags().BoolVarP(&rootOpts.Verbose, "verbose", "v", false, "output additional logging verbosity (info level)")
-	rootCmd.MarkFlagsMutuallyExclusive("debug", "verbose")
-
-	ctx := context.Background()
 
 	makeLogger := func() *slog.Logger {
 		switch {
-		case rootOpts.Debug:
+		case globalOpts.Debug:
 			return slog.New(tint.NewHandler(os.Stdout, &tint.Options{Level: slog.LevelDebug}))
-		case rootOpts.Verbose:
+		case globalOpts.Verbose:
 			return slog.New(tint.NewHandler(os.Stdout, nil))
 		default:
 			return slog.New(tint.NewHandler(os.Stdout, &tint.Options{Level: slog.LevelWarn}))
@@ -82,7 +86,37 @@ Provides command line facilities for the River job queue.
 			DatabaseURL:    databaseURL,
 			DriverProcurer: c.driverProcurer,
 			Logger:         makeLogger(),
+			OutStd:         c.out,
 		}
+	}
+
+	var rootCmd *cobra.Command
+	{
+		var rootOpts struct {
+			Version bool
+		}
+
+		rootCmd = &cobra.Command{
+			Use:   "river",
+			Short: "Provides command line facilities for the River job queue",
+			Long: strings.TrimSpace(`
+Provides command line facilities for the River job queue.
+		`),
+			Run: func(cmd *cobra.Command, args []string) {
+				if rootOpts.Version {
+					RunCommand(ctx, makeCommandBundle(nil), &version{}, &versionOpts{Name: c.name})
+				} else {
+					_ = cmd.Usage()
+				}
+			},
+		}
+		rootCmd.SetOut(c.out)
+
+		rootCmd.PersistentFlags().BoolVar(&globalOpts.Debug, "debug", false, "output maximum logging verbosity (debug level)")
+		rootCmd.PersistentFlags().BoolVarP(&globalOpts.Verbose, "verbose", "v", false, "output additional logging verbosity (info level)")
+		rootCmd.MarkFlagsMutuallyExclusive("debug", "verbose")
+
+		rootCmd.Flags().BoolVar(&rootOpts.Version, "version", false, "print version information")
 	}
 
 	mustMarkFlagRequired := func(cmd *cobra.Command, name string) {
@@ -94,7 +128,7 @@ Provides command line facilities for the River job queue.
 	}
 
 	addDatabaseURLFlag := func(cmd *cobra.Command, databaseURL *string) {
-		cmd.Flags().StringVar(databaseURL, "database-url", "", "URL of the database to benchmark (should look like `postgres://...`")
+		cmd.Flags().StringVar(databaseURL, "database-url", "", "URL of the database (should look like `postgres://...`")
 		mustMarkFlagRequired(cmd, "database-url")
 	}
 	addLineFlag := func(cmd *cobra.Command, line *string) {
@@ -215,6 +249,25 @@ framework, which aren't necessary if using an external framework:
 		rootCmd.AddCommand(cmd)
 	}
 
+	// migrate-list
+	{
+		var opts migrateListOpts
+
+		cmd := &cobra.Command{
+			Use:   "migrate-list",
+			Short: "List River schema migrations",
+			Long: strings.TrimSpace(`
+TODO
+	`),
+			Run: func(cmd *cobra.Command, args []string) {
+				RunCommand(ctx, makeCommandBundle(&opts.DatabaseURL), &migrateList{}, &opts)
+			},
+		}
+		addDatabaseURLFlag(cmd, &opts.DatabaseURL)
+		cmd.Flags().StringVar(&opts.Line, "line", "", "migration line to operate on (default: main)")
+		rootCmd.AddCommand(cmd)
+	}
+
 	// migrate-up
 	{
 		var opts migrateOpts
@@ -259,12 +312,31 @@ migrations that need to be run, but without running them.
 			},
 		}
 		addDatabaseURLFlag(cmd, &opts.DatabaseURL)
+		mustMarkFlagRequired(cmd, "database-url")
 		cmd.Flags().StringVar(&opts.Line, "line", "", "migration line to operate on (default: main)")
+		rootCmd.AddCommand(cmd)
+	}
+
+	// version
+	{
+		cmd := &cobra.Command{
+			Use:   "version",
+			Short: "Print version information",
+			Long: strings.TrimSpace(`
+Print River and Go version information.
+	`),
+			Run: func(cmd *cobra.Command, args []string) {
+				RunCommand(ctx, makeCommandBundle(nil), &version{}, &versionOpts{Name: c.name})
+			},
+		}
 		rootCmd.AddCommand(cmd)
 	}
 
 	return rootCmd
 }
+
+// SetOut sets standard output. Should be called before BaseCommandSet.
+func (c *CLI) SetOut(out io.Writer) { c.out = out }
 
 type benchOpts struct {
 	DatabaseURL  string
@@ -315,7 +387,12 @@ type migrateDown struct {
 }
 
 func (c *migrateDown) Run(ctx context.Context, opts *migrateOpts) (bool, error) {
-	res, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger}).Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{
+	migrator, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	if err != nil {
+		return false, err
+	}
+
+	res, err := migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{
 		DryRun:        opts.DryRun,
 		MaxSteps:      opts.MaxSteps,
 		TargetVersion: opts.TargetVersion,
@@ -398,7 +475,10 @@ func (c *migrateGet) Run(_ context.Context, opts *migrateGetOpts) (bool, error) 
 	// other databases is added in the future. Unlike other migrate commands,
 	// this one doesn't take a `--database-url`, so we'd need a way of
 	// detecting the database type.
-	migrator := rivermigrate.New(c.DriverProcurer.ProcurePgxV5(nil), &rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	migrator, err := rivermigrate.New(c.DriverProcurer.ProcurePgxV5(nil), &rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	if err != nil {
+		return false, err
+	}
 
 	var migrations []rivermigrate.Migration
 	if opts.All {
@@ -450,12 +530,61 @@ func (c *migrateGet) Run(_ context.Context, opts *migrateGetOpts) (bool, error) 
 	return true, nil
 }
 
+type migrateListOpts struct {
+	DatabaseURL string
+	Line        string
+}
+
+func (o *migrateListOpts) Validate() error { return nil }
+
+type migrateList struct {
+	CommandBase
+}
+
+func (c *migrateList) Run(ctx context.Context, opts *migrateListOpts) (bool, error) {
+	migrator, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	if err != nil {
+		return false, err
+	}
+
+	allMigrations := migrator.AllVersions()
+
+	existingMigrations, err := migrator.ExistingVersions(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	var maxExistingVersion int
+	if len(existingMigrations) > 0 {
+		maxExistingVersion = existingMigrations[len(existingMigrations)-1].Version
+	}
+
+	for _, migration := range allMigrations {
+		var currentVersionPrefix string
+		switch {
+		case migration.Version == maxExistingVersion:
+			currentVersionPrefix = "* "
+		case maxExistingVersion > 0:
+			currentVersionPrefix = "  "
+		}
+
+		fmt.Fprintf(c.Out, "%s%03d %s\n", currentVersionPrefix, migration.Version, migration.Name)
+	}
+
+	return true, nil
+}
+
 type migrateUp struct {
 	CommandBase
 }
 
 func (c *migrateUp) Run(ctx context.Context, opts *migrateOpts) (bool, error) {
-	res, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger}).Migrate(ctx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{
+	migrator, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	if err != nil {
+		return false, err
+	}
+
+	res, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{
 		DryRun:        opts.DryRun,
 		MaxSteps:      opts.MaxSteps,
 		TargetVersion: opts.TargetVersion,
@@ -487,10 +616,40 @@ type validate struct {
 }
 
 func (c *validate) Run(ctx context.Context, opts *validateOpts) (bool, error) {
-	res, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger}).Validate(ctx)
+	migrator, err := c.GetMigrator(&rivermigrate.Config{Line: opts.Line, Logger: c.Logger})
+	if err != nil {
+		return false, err
+	}
+
+	res, err := migrator.Validate(ctx)
 	if err != nil {
 		return false, err
 	}
 
 	return res.OK, nil
+}
+
+type versionOpts struct {
+	Name string
+}
+
+func (o *versionOpts) Validate() error {
+	if o.Name == "" {
+		return errors.New("name should be set")
+	}
+
+	return nil
+}
+
+type version struct {
+	CommandBase
+}
+
+func (c *version) Run(ctx context.Context, opts *versionOpts) (bool, error) {
+	buildInfo, _ := debug.ReadBuildInfo()
+
+	fmt.Fprintf(c.Out, "%s version %s\n", opts.Name, valutil.ValOrDefault(buildInfo.Main.Version, "(unknown)"))
+	fmt.Fprintf(c.Out, "Built with %s\n", buildInfo.GoVersion)
+
+	return true, nil
 }

@@ -13,12 +13,7 @@ import (
 
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/slogtest"
-	"github.com/riverqueue/river/rivershared/util/randutil"
 )
-
-// Shared rand instance for archetypes. Random number generation is rare
-// enough that it's not likely to produce much contention.
-var rand = randutil.NewCryptoSeededConcurrentSafeRand() //nolint:gochecknoglobals
 
 // BaseServiceArchetype returns a new base service suitable for use in tests.
 // Returns a new instance so that it's not possible to accidentally taint a
@@ -28,7 +23,6 @@ func BaseServiceArchetype(tb testing.TB) *baseservice.Archetype {
 
 	return &baseservice.Archetype{
 		Logger: Logger(tb),
-		Rand:   rand,
 		Time:   &TimeStub{},
 	}
 }
@@ -151,7 +145,7 @@ func WaitTimeout() time.Duration {
 }
 
 var IgnoredKnownGoroutineLeaks = []goleak.Option{ //nolint:gochecknoglobals
-	// This goroutine contains a 500 ms uninterruptable sleep that may still be
+	// This goroutine contains a 500 ms uninterruptible sleep that may still be
 	// running by the time the test suite finishes and cause a failure. This
 	// might be something that should be fixed in pgx, but ignore it for the
 	// time being lest we have intermittent tests.

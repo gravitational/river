@@ -18,10 +18,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/lib/pq"
 
+	"github.com/riverqueue/river/internal/dbunique"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverdatabasesql/internal/dbsqlc"
+	"github.com/riverqueue/river/riverdriver/riverdatabasesql/internal/pgtypealias"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 	"github.com/riverqueue/river/rivertype"
@@ -137,7 +140,8 @@ func (e *Executor) JobDeleteBefore(ctx context.Context, params *riverdriver.JobD
 func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobGetAvailableParams) ([]*rivertype.JobRow, error) {
 	jobs, err := dbsqlc.New().JobGetAvailable(ctx, e.dbtx, &dbsqlc.JobGetAvailableParams{
 		AttemptedBy: params.AttemptedBy,
-		Max:         int32(params.Max),
+		Max:         int32(min(params.Max, math.MaxInt32)), //nolint:gosec
+		Now:         params.Now,
 		Queue:       params.Queue,
 	})
 	if err != nil {
@@ -190,45 +194,28 @@ func (e *Executor) JobGetByKindMany(ctx context.Context, kind []string) ([]*rive
 }
 
 func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
-	jobs, err := dbsqlc.New().JobGetStuck(ctx, e.dbtx, &dbsqlc.JobGetStuckParams{Max: int32(params.Max), StuckHorizon: params.StuckHorizon})
+	jobs, err := dbsqlc.New().JobGetStuck(ctx, e.dbtx, &dbsqlc.JobGetStuckParams{Max: int32(min(params.Max, math.MaxInt32)), StuckHorizon: params.StuckHorizon}) //nolint:gosec
 	if err != nil {
 		return nil, interpretError(err)
 	}
 	return mapSliceError(jobs, jobRowFromInternal)
 }
 
-func (e *Executor) JobInsertFast(ctx context.Context, params *riverdriver.JobInsertFastParams) (*rivertype.JobRow, error) {
-	job, err := dbsqlc.New().JobInsertFast(ctx, e.dbtx, &dbsqlc.JobInsertFastParams{
-		Args:        string(params.EncodedArgs),
-		CreatedAt:   params.CreatedAt,
-		Kind:        params.Kind,
-		MaxAttempts: int16(min(params.MaxAttempts, math.MaxInt16)),
-		Metadata:    valutil.ValOrDefault(string(params.Metadata), "{}"),
-		Priority:    int16(min(params.Priority, math.MaxInt16)),
-		Queue:       params.Queue,
-		ScheduledAt: params.ScheduledAt,
-		State:       dbsqlc.RiverJobState(params.State),
-		Tags:        params.Tags,
-	})
-	if err != nil {
-		return nil, interpretError(err)
-	}
-	return jobRowFromInternal(job)
-}
-
-func (e *Executor) JobInsertFastMany(ctx context.Context, params []*riverdriver.JobInsertFastParams) (int, error) {
+func (e *Executor) JobInsertFastMany(ctx context.Context, params []*riverdriver.JobInsertFastParams) ([]*riverdriver.JobInsertFastResult, error) {
 	insertJobsParams := &dbsqlc.JobInsertFastManyParams{
-		Args:        make([]string, len(params)),
-		Kind:        make([]string, len(params)),
-		MaxAttempts: make([]int16, len(params)),
-		Metadata:    make([]string, len(params)),
-		Priority:    make([]int16, len(params)),
-		Queue:       make([]string, len(params)),
-		ScheduledAt: make([]time.Time, len(params)),
-		State:       make([]dbsqlc.RiverJobState, len(params)),
-		Tags:        make([]string, len(params)),
+		Args:         make([]string, len(params)),
+		Kind:         make([]string, len(params)),
+		MaxAttempts:  make([]int16, len(params)),
+		Metadata:     make([]string, len(params)),
+		Priority:     make([]int16, len(params)),
+		Queue:        make([]string, len(params)),
+		ScheduledAt:  make([]time.Time, len(params)),
+		State:        make([]string, len(params)),
+		Tags:         make([]string, len(params)),
+		UniqueKey:    make([][]byte, len(params)),
+		UniqueStates: make([]pgtypealias.Bits, len(params)),
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 
 	for i := 0; i < len(params); i++ {
 		params := params[i]
@@ -243,18 +230,80 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params []*riverdriver.
 			tags = []string{}
 		}
 
-		insertJobsParams.Args[i] = valutil.ValOrDefault(string(params.EncodedArgs), "{}")
+		defaultObject := "{}"
+
+		insertJobsParams.Args[i] = valutil.ValOrDefault(string(params.EncodedArgs), defaultObject)
 		insertJobsParams.Kind[i] = params.Kind
-		insertJobsParams.MaxAttempts[i] = int16(min(params.MaxAttempts, math.MaxInt16))
-		insertJobsParams.Metadata[i] = valutil.ValOrDefault(string(params.Metadata), "{}")
-		insertJobsParams.Priority[i] = int16(min(params.Priority, math.MaxInt16))
+		insertJobsParams.MaxAttempts[i] = int16(min(params.MaxAttempts, math.MaxInt16)) //nolint:gosec
+		insertJobsParams.Metadata[i] = valutil.ValOrDefault(string(params.Metadata), defaultObject)
+		insertJobsParams.Priority[i] = int16(min(params.Priority, math.MaxInt16)) //nolint:gosec
+		insertJobsParams.Queue[i] = params.Queue
+		insertJobsParams.ScheduledAt[i] = scheduledAt
+		insertJobsParams.State[i] = string(params.State)
+		insertJobsParams.Tags[i] = strings.Join(tags, ",")
+		insertJobsParams.UniqueKey[i] = sliceutil.DefaultIfEmpty(params.UniqueKey, nil)
+		insertJobsParams.UniqueStates[i] = pgtypealias.Bits{Bits: pgtype.Bits{Bytes: []byte{params.UniqueStates}, Len: 8, Valid: params.UniqueStates != 0}}
+	}
+
+	items, err := dbsqlc.New().JobInsertFastMany(ctx, e.dbtx, insertJobsParams)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	return mapSliceError(items, func(row *dbsqlc.JobInsertFastManyRow) (*riverdriver.JobInsertFastResult, error) {
+		job, err := jobRowFromInternal(&row.RiverJob)
+		if err != nil {
+			return nil, err
+		}
+		return &riverdriver.JobInsertFastResult{Job: job, UniqueSkippedAsDuplicate: row.UniqueSkippedAsDuplicate}, nil
+	})
+}
+
+func (e *Executor) JobInsertFastManyNoReturning(ctx context.Context, params []*riverdriver.JobInsertFastParams) (int, error) {
+	insertJobsParams := &dbsqlc.JobInsertFastManyNoReturningParams{
+		Args:         make([]string, len(params)),
+		Kind:         make([]string, len(params)),
+		MaxAttempts:  make([]int16, len(params)),
+		Metadata:     make([]string, len(params)),
+		Priority:     make([]int16, len(params)),
+		Queue:        make([]string, len(params)),
+		ScheduledAt:  make([]time.Time, len(params)),
+		State:        make([]dbsqlc.RiverJobState, len(params)),
+		Tags:         make([]string, len(params)),
+		UniqueKey:    make([][]byte, len(params)),
+		UniqueStates: make([]pgtypealias.Bits, len(params)),
+	}
+	now := time.Now().UTC()
+
+	for i := 0; i < len(params); i++ {
+		params := params[i]
+
+		scheduledAt := now
+		if params.ScheduledAt != nil {
+			scheduledAt = *params.ScheduledAt
+		}
+
+		tags := params.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+
+		defaultObject := "{}"
+
+		insertJobsParams.Args[i] = valutil.ValOrDefault(string(params.EncodedArgs), defaultObject)
+		insertJobsParams.Kind[i] = params.Kind
+		insertJobsParams.MaxAttempts[i] = int16(min(params.MaxAttempts, math.MaxInt16)) //nolint:gosec
+		insertJobsParams.Metadata[i] = valutil.ValOrDefault(string(params.Metadata), defaultObject)
+		insertJobsParams.Priority[i] = int16(min(params.Priority, math.MaxInt16)) //nolint:gosec
 		insertJobsParams.Queue[i] = params.Queue
 		insertJobsParams.ScheduledAt[i] = scheduledAt
 		insertJobsParams.State[i] = dbsqlc.RiverJobState(params.State)
 		insertJobsParams.Tags[i] = strings.Join(tags, ",")
+		insertJobsParams.UniqueKey[i] = params.UniqueKey
+		insertJobsParams.UniqueStates[i] = pgtypealias.Bits{Bits: pgtype.Bits{Bytes: []byte{params.UniqueStates}, Len: 8, Valid: params.UniqueStates != 0}}
 	}
 
-	numInserted, err := dbsqlc.New().JobInsertFastMany(ctx, e.dbtx, insertJobsParams)
+	numInserted, err := dbsqlc.New().JobInsertFastManyNoReturning(ctx, e.dbtx, insertJobsParams)
 	if err != nil {
 		return 0, interpretError(err)
 	}
@@ -264,55 +313,27 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params []*riverdriver.
 
 func (e *Executor) JobInsertFull(ctx context.Context, params *riverdriver.JobInsertFullParams) (*rivertype.JobRow, error) {
 	job, err := dbsqlc.New().JobInsertFull(ctx, e.dbtx, &dbsqlc.JobInsertFullParams{
-		Attempt:     int16(params.Attempt),
-		AttemptedAt: params.AttemptedAt,
-		Args:        string(params.EncodedArgs),
-		CreatedAt:   params.CreatedAt,
-		Errors:      sliceutil.Map(params.Errors, func(e []byte) string { return string(e) }),
-		FinalizedAt: params.FinalizedAt,
-		Kind:        params.Kind,
-		MaxAttempts: int16(min(params.MaxAttempts, math.MaxInt16)),
-		Metadata:    valutil.ValOrDefault(string(params.Metadata), "{}"),
-		Priority:    int16(min(params.Priority, math.MaxInt16)),
-		Queue:       params.Queue,
-		ScheduledAt: params.ScheduledAt,
-		State:       dbsqlc.RiverJobState(params.State),
-		Tags:        params.Tags,
-		UniqueKey:   params.UniqueKey,
+		Attempt:      int16(min(params.Attempt, math.MaxInt16)), //nolint:gosec
+		AttemptedAt:  params.AttemptedAt,
+		Args:         string(params.EncodedArgs),
+		CreatedAt:    params.CreatedAt,
+		Errors:       sliceutil.Map(params.Errors, func(e []byte) string { return string(e) }),
+		FinalizedAt:  params.FinalizedAt,
+		Kind:         params.Kind,
+		MaxAttempts:  int16(min(params.MaxAttempts, math.MaxInt16)), //nolint:gosec
+		Metadata:     valutil.ValOrDefault(string(params.Metadata), "{}"),
+		Priority:     int16(min(params.Priority, math.MaxInt16)), //nolint:gosec
+		Queue:        params.Queue,
+		ScheduledAt:  params.ScheduledAt,
+		State:        dbsqlc.RiverJobState(params.State),
+		Tags:         params.Tags,
+		UniqueKey:    params.UniqueKey,
+		UniqueStates: pgtypealias.Bits{Bits: pgtype.Bits{Bytes: []byte{params.UniqueStates}, Len: 8, Valid: params.UniqueStates != 0}},
 	})
 	if err != nil {
 		return nil, interpretError(err)
 	}
 	return jobRowFromInternal(job)
-}
-
-func (e *Executor) JobInsertUnique(ctx context.Context, params *riverdriver.JobInsertUniqueParams) (*riverdriver.JobInsertUniqueResult, error) {
-	insertRes, err := dbsqlc.New().JobInsertUnique(ctx, e.dbtx, &dbsqlc.JobInsertUniqueParams{
-		Args:        string(params.EncodedArgs),
-		CreatedAt:   params.CreatedAt,
-		Kind:        params.Kind,
-		MaxAttempts: int16(min(params.MaxAttempts, math.MaxInt16)),
-		Metadata:    valutil.ValOrDefault(string(params.Metadata), "{}"),
-		Priority:    int16(min(params.Priority, math.MaxInt16)),
-		Queue:       params.Queue,
-		ScheduledAt: params.ScheduledAt,
-		State:       dbsqlc.RiverJobState(params.State),
-		Tags:        params.Tags,
-		UniqueKey:   params.UniqueKey,
-	})
-	if err != nil {
-		return nil, interpretError(err)
-	}
-
-	jobRow, err := jobRowFromInternal(&insertRes.RiverJob)
-	if err != nil {
-		return nil, err
-	}
-
-	return &riverdriver.JobInsertUniqueResult{
-		Job:                      jobRow,
-		UniqueSkippedAsDuplicate: insertRes.UniqueSkippedAsDuplicate,
-	}, nil
 }
 
 func (e *Executor) JobList(ctx context.Context, query string, namedArgs map[string]any) ([]*rivertype.JobRow, error) {
@@ -347,6 +368,8 @@ func (e *Executor) JobList(ctx context.Context, query string, namedArgs map[stri
 			&i.State,
 			&i.ScheduledAt,
 			pq.Array(&i.Tags),
+			&i.UniqueKey,
+			&i.UniqueStates,
 		); err != nil {
 			return nil, err
 		}
@@ -452,7 +475,7 @@ func replaceNamed(query string, namedArgs map[string]any) (string, error) {
 }
 
 func (e *Executor) JobListFields() string {
-	return "id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags"
+	return "id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states"
 }
 
 func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
@@ -477,15 +500,21 @@ func (e *Executor) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow, e
 	return jobRowFromInternal(job)
 }
 
-func (e *Executor) JobSchedule(ctx context.Context, params *riverdriver.JobScheduleParams) ([]*rivertype.JobRow, error) {
-	jobs, err := dbsqlc.New().JobSchedule(ctx, e.dbtx, &dbsqlc.JobScheduleParams{
+func (e *Executor) JobSchedule(ctx context.Context, params *riverdriver.JobScheduleParams) ([]*riverdriver.JobScheduleResult, error) {
+	scheduleResults, err := dbsqlc.New().JobSchedule(ctx, e.dbtx, &dbsqlc.JobScheduleParams{
 		Max: int64(params.Max),
 		Now: params.Now,
 	})
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return mapSliceError(jobs, jobRowFromInternal)
+	return mapSliceError(scheduleResults, func(result *dbsqlc.JobScheduleRow) (*riverdriver.JobScheduleResult, error) {
+		job, err := jobRowFromInternal(&result.RiverJob)
+		if err != nil {
+			return nil, err
+		}
+		return &riverdriver.JobScheduleResult{ConflictDiscarded: result.ConflictDiscarded, Job: *job}, nil
+	})
 }
 
 func (e *Executor) JobSetCompleteIfRunningMany(ctx context.Context, params *riverdriver.JobSetCompleteIfRunningManyParams) ([]*rivertype.JobRow, error) {
@@ -502,7 +531,7 @@ func (e *Executor) JobSetCompleteIfRunningMany(ctx context.Context, params *rive
 func (e *Executor) JobSetStateIfRunning(ctx context.Context, params *riverdriver.JobSetStateIfRunningParams) (*rivertype.JobRow, error) {
 	var maxAttempts int16
 	if params.MaxAttempts != nil {
-		maxAttempts = int16(*params.MaxAttempts)
+		maxAttempts = int16(min(*params.MaxAttempts, math.MaxInt16)) //nolint:gosec
 	}
 
 	job, err := dbsqlc.New().JobSetStateIfRunning(ctx, e.dbtx, &dbsqlc.JobSetStateIfRunningParams{
@@ -523,21 +552,62 @@ func (e *Executor) JobSetStateIfRunning(ctx context.Context, params *riverdriver
 	return jobRowFromInternal(job)
 }
 
+func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	setStateParams := &dbsqlc.JobSetStateIfRunningManyParams{
+		IDs:                 params.ID,
+		Errors:              make([]string, len(params.ID)),
+		ErrorsDoUpdate:      make([]bool, len(params.ID)),
+		FinalizedAt:         make([]time.Time, len(params.ID)),
+		FinalizedAtDoUpdate: make([]bool, len(params.ID)),
+		MaxAttempts:         make([]int32, len(params.ID)),
+		MaxAttemptsDoUpdate: make([]bool, len(params.ID)),
+		ScheduledAt:         make([]time.Time, len(params.ID)),
+		ScheduledAtDoUpdate: make([]bool, len(params.ID)),
+		State:               make([]string, len(params.ID)),
+	}
+
+	const defaultObject = "{}"
+
+	for i := 0; i < len(params.ID); i++ {
+		setStateParams.Errors[i] = valutil.ValOrDefault(string(params.ErrData[i]), defaultObject)
+		if params.ErrData[i] != nil {
+			setStateParams.ErrorsDoUpdate[i] = true
+		}
+		if params.FinalizedAt[i] != nil {
+			setStateParams.FinalizedAtDoUpdate[i] = true
+			setStateParams.FinalizedAt[i] = *params.FinalizedAt[i]
+		}
+		if params.MaxAttempts[i] != nil {
+			setStateParams.MaxAttemptsDoUpdate[i] = true
+			setStateParams.MaxAttempts[i] = int32(*params.MaxAttempts[i]) //nolint:gosec
+		}
+		if params.ScheduledAt[i] != nil {
+			setStateParams.ScheduledAtDoUpdate[i] = true
+			setStateParams.ScheduledAt[i] = *params.ScheduledAt[i]
+		}
+		setStateParams.State[i] = string(params.State[i])
+	}
+
+	jobs, err := dbsqlc.New().JobSetStateIfRunningMany(ctx, e.dbtx, setStateParams)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return mapSliceError(jobs, jobRowFromInternal)
+}
+
 func (e *Executor) JobUpdate(ctx context.Context, params *riverdriver.JobUpdateParams) (*rivertype.JobRow, error) {
 	job, err := dbsqlc.New().JobUpdate(ctx, e.dbtx, &dbsqlc.JobUpdateParams{
 		ID:                  params.ID,
 		AttemptedAtDoUpdate: params.AttemptedAtDoUpdate,
 		AttemptedAt:         params.AttemptedAt,
 		AttemptDoUpdate:     params.AttemptDoUpdate,
-		Attempt:             int16(params.Attempt),
+		Attempt:             int16(min(params.Attempt, math.MaxInt16)), //nolint:gosec
 		ErrorsDoUpdate:      params.ErrorsDoUpdate,
 		Errors:              sliceutil.Map(params.Errors, func(e []byte) string { return string(e) }),
 		FinalizedAtDoUpdate: params.FinalizedAtDoUpdate,
 		FinalizedAt:         params.FinalizedAt,
 		StateDoUpdate:       params.StateDoUpdate,
 		State:               dbsqlc.RiverJobState(params.State),
-		UniqueKeyDoUpdate:   params.UniqueKeyDoUpdate,
-		UniqueKey:           params.UniqueKey,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -732,7 +802,7 @@ func (e *Executor) QueueGet(ctx context.Context, name string) (*rivertype.Queue,
 }
 
 func (e *Executor) QueueList(ctx context.Context, limit int) ([]*rivertype.Queue, error) {
-	internalQueues, err := dbsqlc.New().QueueList(ctx, e.dbtx, int32(limit))
+	internalQueues, err := dbsqlc.New().QueueList(ctx, e.dbtx, int32(min(limit, math.MaxInt32))) //nolint:gosec
 	if err != nil {
 		return nil, interpretError(err)
 	}
@@ -902,24 +972,30 @@ func jobRowFromInternal(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
 		finalizedAt = &t
 	}
 
+	var uniqueStatesByte byte
+	if internal.UniqueStates.Valid && len(internal.UniqueStates.Bytes) > 0 {
+		uniqueStatesByte = internal.UniqueStates.Bytes[0]
+	}
+
 	return &rivertype.JobRow{
-		ID:          internal.ID,
-		Attempt:     max(int(internal.Attempt), 0),
-		AttemptedAt: attemptedAt,
-		AttemptedBy: internal.AttemptedBy,
-		CreatedAt:   internal.CreatedAt.UTC(),
-		EncodedArgs: []byte(internal.Args),
-		Errors:      errors,
-		FinalizedAt: finalizedAt,
-		Kind:        internal.Kind,
-		MaxAttempts: max(int(internal.MaxAttempts), 0),
-		Metadata:    []byte(internal.Metadata),
-		Priority:    max(int(internal.Priority), 0),
-		Queue:       internal.Queue,
-		ScheduledAt: internal.ScheduledAt.UTC(),
-		State:       rivertype.JobState(internal.State),
-		Tags:        internal.Tags,
-		UniqueKey:   internal.UniqueKey,
+		ID:           internal.ID,
+		Attempt:      max(int(internal.Attempt), 0),
+		AttemptedAt:  attemptedAt,
+		AttemptedBy:  internal.AttemptedBy,
+		CreatedAt:    internal.CreatedAt.UTC(),
+		EncodedArgs:  []byte(internal.Args),
+		Errors:       errors,
+		FinalizedAt:  finalizedAt,
+		Kind:         internal.Kind,
+		MaxAttempts:  max(int(internal.MaxAttempts), 0),
+		Metadata:     []byte(internal.Metadata),
+		Priority:     max(int(internal.Priority), 0),
+		Queue:        internal.Queue,
+		ScheduledAt:  internal.ScheduledAt.UTC(),
+		State:        rivertype.JobState(internal.State),
+		Tags:         internal.Tags,
+		UniqueKey:    internal.UniqueKey,
+		UniqueStates: dbunique.UniqueBitmaskToStates(uniqueStatesByte),
 	}, nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivershared/util/timeutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -141,25 +142,32 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 		workUnitFactory := newWorkUnitFactoryWithCustomRetry(func() error { return nil }, nil)
 
-		job, err := exec.JobInsertFast(ctx, &riverdriver.JobInsertFastParams{
+		now := time.Now().UTC()
+		results, err := exec.JobInsertFastMany(ctx, []*riverdriver.JobInsertFastParams{{
 			EncodedArgs: []byte("{}"),
 			Kind:        (callbackArgs{}).Kind(),
 			MaxAttempts: rivercommon.MaxAttemptsDefault,
 			Priority:    rivercommon.PriorityDefault,
 			Queue:       rivercommon.QueueDefault,
+			// Needs to be explicitly set to a "now" horizon that's aligned with the
+			// JobGetAvailable call. InsertMany applies a default scheduled_at in Go
+			// so it can't pick up the Postgres-level `now()` default.
+			ScheduledAt: ptrutil.Ptr(now),
 			State:       rivertype.JobStateAvailable,
-		})
+		}})
 		require.NoError(t, err)
 
 		// Fetch the job to make sure it's marked as running:
 		jobs, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
 			Max:   1,
+			Now:   ptrutil.Ptr(now),
 			Queue: rivercommon.QueueDefault,
 		})
 		require.NoError(t, err)
+
 		require.Len(t, jobs, 1)
-		require.Equal(t, job.ID, jobs[0].ID)
-		job = jobs[0]
+		require.Equal(t, results[0].Job.ID, jobs[0].ID)
+		job := jobs[0]
 
 		bundle := &testBundle{
 			completer:    completer,
@@ -334,10 +342,8 @@ func TestJobExecutor_Execute(t *testing.T) {
 		// add a unique key so we can verify it's cleared
 		var err error
 		bundle.jobRow, err = bundle.exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
-			ID:                bundle.jobRow.ID,
-			State:             rivertype.JobStateAvailable, // required for encoding but ignored
-			UniqueKeyDoUpdate: true,
-			UniqueKey:         []byte("unique-key"),
+			ID:    bundle.jobRow.ID,
+			State: rivertype.JobStateAvailable, // required for encoding but ignored
 		})
 		require.NoError(t, err)
 
@@ -355,7 +361,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 		require.Len(t, job.Errors, 1)
 		require.WithinDuration(t, time.Now(), job.Errors[0].At, 2*time.Second)
 		require.Equal(t, 1, job.Errors[0].Attempt)
-		require.Equal(t, "jobCancelError: throw away this job", job.Errors[0].Error)
+		require.Equal(t, "JobCancelError: throw away this job", job.Errors[0].Error)
 		require.Equal(t, "", job.Errors[0].Trace)
 	})
 
@@ -694,7 +700,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 		require.Len(t, job.Errors, 1)
 		require.WithinDuration(t, time.Now(), job.Errors[0].At, 2*time.Second)
 		require.Equal(t, 1, job.Errors[0].Attempt)
-		require.Equal(t, "jobCancelError: job cancelled remotely", job.Errors[0].Error)
+		require.Equal(t, "JobCancelError: job cancelled remotely", job.Errors[0].Error)
 		require.Equal(t, ErrJobCancelledRemotely.Error(), job.Errors[0].Error)
 		require.Equal(t, "", job.Errors[0].Trace)
 	})

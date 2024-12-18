@@ -6,15 +6,10 @@
 package baseservice
 
 import (
-	"context"
 	"log/slog"
-	"math"
-	"math/rand"
 	"reflect"
+	"regexp"
 	"time"
-
-	"github.com/riverqueue/river/rivershared/util/randutil"
-	"github.com/riverqueue/river/rivershared/util/timeutil"
 )
 
 // Archetype contains the set of base service properties that are immutable, or
@@ -25,21 +20,21 @@ type Archetype struct {
 	// Logger is a structured logger.
 	Logger *slog.Logger
 
-	// Rand is a random source safe for concurrent access and seeded with a
-	// cryptographically random seed to ensure good distribution between nodes
-	// and services. The random source itself is _not_ cryptographically secure,
-	// and therefore should not be used anywhere security-related. This is a
-	// deliberate choice because Go's non-crypto rand source is about twenty
-	// times faster, and so far none of our uses of random require cryptographic
-	// secure randomness.
-	Rand *rand.Rand
-
 	// Time returns a time generator to get the current time in UTC. Normally
 	// it's implemented as UnStubbableTimeGenerator which just calls through to
 	// `time.Now().UTC()`, but is riverinternaltest.timeStub in tests to allow
 	// the current time to be stubbed.  Services should try to use this function
 	// instead of the vanilla ones from the `time` package for testing purposes.
 	Time TimeGenerator
+}
+
+// NewArchetype returns a new archetype. This function is most suitable for
+// non-test usage wherein nothing should be stubbed.
+func NewArchetype(logger *slog.Logger) *Archetype {
+	return &Archetype{
+		Logger: logger,
+		Time:   &UnStubbableTimeGenerator{},
+	}
 }
 
 // BaseService is a struct that's meant to be embedded on "service-like" objects
@@ -60,98 +55,7 @@ type BaseService struct {
 	Name string
 }
 
-// CancellableSleep sleeps for the given duration, but returns early if context
-// has been cancelled.
-func (s *BaseService) CancellableSleep(ctx context.Context, sleepDuration time.Duration) {
-	timer := time.NewTimer(sleepDuration)
-
-	select {
-	case <-ctx.Done():
-		if !timer.Stop() {
-			<-timer.C
-		}
-	case <-timer.C:
-	}
-}
-
-// CancellableSleep sleeps for the given duration, but returns early if context
-// has been cancelled.
-//
-// This variant returns a channel that should be waited on and which will be
-// closed when either the sleep or context is done.
-func (s *BaseService) CancellableSleepC(ctx context.Context, sleepDuration time.Duration) <-chan struct{} {
-	doneChan := make(chan struct{})
-
-	go func() {
-		defer close(doneChan)
-		s.CancellableSleep(ctx, sleepDuration)
-	}()
-
-	return doneChan
-}
-
-// CancellableSleepRandomBetween sleeps for a random duration between the given
-// bounds (max bound is exclusive), but returns early if context has been
-// cancelled.
-func (s *BaseService) CancellableSleepRandomBetween(ctx context.Context, sleepDurationMin, sleepDurationMax time.Duration) {
-	s.CancellableSleep(ctx, time.Duration(randutil.IntBetween(s.Rand, int(sleepDurationMin), int(sleepDurationMax))))
-}
-
-// CancellableSleepRandomBetween sleeps for a random duration between the given
-// bounds (max bound is exclusive), but returns early if context has been
-// cancelled.
-//
-// This variant returns a channel that should be waited on and which will be
-// closed when either the sleep or context is done.
-func (s *BaseService) CancellableSleepRandomBetweenC(ctx context.Context, sleepDurationMin, sleepDurationMax time.Duration) <-chan struct{} {
-	doneChan := make(chan struct{})
-
-	go func() {
-		defer close(doneChan)
-		s.CancellableSleep(ctx, time.Duration(randutil.IntBetween(s.Rand, int(sleepDurationMin), int(sleepDurationMax))))
-	}()
-
-	return doneChan
-}
-
-// MaxAttemptsBeforeResetDefault is the number of attempts during exponential
-// backoff after which attempts is reset so that sleep durations aren't flung
-// into a ridiculously distant future. This constant is typically injected into
-// the CancellableSleepExponentialBackoff function. It could technically take
-// another value instead, but shouldn't unless there's a good reason to do so.
-const MaxAttemptsBeforeResetDefault = 10
-
-// ExponentialBackoff returns a duration for a reasonable exponential backoff
-// interval for a service based on the given attempt number, which can then be
-// fed into CancellableSleep to perform the sleep. Uses a 2**N second algorithm,
-// +/- 10% random jitter. Sleep is cancelled if the given context is cancelled.
-//
-// Attempt should start at one for the first backoff/failure.
-func (s *BaseService) ExponentialBackoff(attempt, maxAttemptsBeforeReset int) time.Duration {
-	retrySeconds := s.exponentialBackoffSecondsWithoutJitter(attempt, maxAttemptsBeforeReset)
-
-	// Jitter number of seconds +/- 10%.
-	retrySeconds += retrySeconds * (s.Rand.Float64()*0.2 - 0.1)
-
-	return timeutil.SecondsAsDuration(retrySeconds)
-}
-
-func (s *BaseService) exponentialBackoffSecondsWithoutJitter(attempt, maxAttemptsBeforeReset int) float64 {
-	// It's easier for callers and more intuitive if attempt starts at one, but
-	// subtract one before sending it the exponent so we start at only one
-	// second of sleep instead of two.
-	attempt--
-
-	// We use a different exponential backoff algorithm here compared to the
-	// default retry policy (2**N versus N**4) because it results in more
-	// retries sooner. When it comes to exponential backoffs in services we
-	// never want to sleep for hours/days, unlike with failed jobs.
-	return math.Pow(2, float64(attempt%maxAttemptsBeforeReset))
-}
-
-func (s *BaseService) GetBaseService() *BaseService {
-	return s
-}
+func (s *BaseService) GetBaseService() *BaseService { return s }
 
 // withBaseService is an interface to a struct that embeds BaseService. An
 // implementation is provided automatically by BaseService, and it's largely
@@ -166,8 +70,7 @@ func Init[TService withBaseService](archetype *Archetype, service TService) TSer
 	baseService := service.GetBaseService()
 
 	baseService.Logger = archetype.Logger
-	baseService.Name = reflect.TypeOf(service).Elem().Name()
-	baseService.Rand = archetype.Rand
+	baseService.Name = simplifyLogName(reflect.TypeOf(service).Elem().Name())
 	baseService.Time = archetype.Time
 
 	return service
@@ -201,4 +104,19 @@ func (g *UnStubbableTimeGenerator) NowUTC() time.Time       { return time.Now() 
 func (g *UnStubbableTimeGenerator) NowUTCOrNil() *time.Time { return nil }
 func (g *UnStubbableTimeGenerator) StubNowUTC(nowUTC time.Time) time.Time {
 	panic("time not stubbable outside tests")
+}
+
+var stripGenericTypePathRE = regexp.MustCompile(`\[([\[\]\*]*).*/([^/]+)\]`)
+
+// Simplifies the name of a Go type that uses generics for cleaner logging output.
+//
+// So this:
+//
+//	QueryCacher[[]*github.com/riverqueue/riverui/internal/dbsqlc.JobCountByStateRow]
+//
+// Becomes this:
+//
+//	QueryCacher[[]*dbsqlc.JobCountByStateRow]
+func simplifyLogName(name string) string {
+	return stripGenericTypePathRE.ReplaceAllString(name, `[$1$2]`)
 }

@@ -87,12 +87,14 @@ It's often desirable to have a client that'll be used for inserting jobs, but
 not working them. This is possible by omitting the `Queues` configuration, and
 skipping the call to `Start`:
 
-	riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
-	    Workers: workers,
-	})
-	if err != nil {
-	    panic(err)
-	}
+```go
+riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
+    Workers: workers,
+})
+if err != nil {
+    panic(err)
+}
+```
 
 `Workers` can also be omitted, but it's better to include it so River can check
 that inserted job kinds have a worker that can run them.
@@ -176,7 +178,7 @@ See [developing River].
 
 ## Thank you
 
-River was in large part inspired by our experiences with other background job libaries over the years, most notably:
+River was in large part inspired by our experiences with other background job libraries over the years, most notably:
 
 - [Oban](https://github.com/sorentwo/oban) in Elixir.
 - [Que](https://github.com/que-rb/que), [Sidekiq](https://github.com/sidekiq/sidekiq), [Delayed::Job](https://github.com/collectiveidea/delayed_job), and [GoodJob](https://github.com/bensheldon/good_job) in Ruby.

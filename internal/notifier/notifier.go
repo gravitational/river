@@ -8,11 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
+	"github.com/riverqueue/river/rivershared/testsignal"
 	"github.com/riverqueue/river/rivershared/util/maputil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 )
 
@@ -35,8 +36,8 @@ type Subscription struct {
 
 func (s *Subscription) Unlisten(ctx context.Context) {
 	s.unlistenOnce.Do(func() {
-		// Unlisten uses background context in case of cancellation.
-		if err := s.notifier.unlisten(context.Background(), s); err != nil { //nolint:contextcheck
+		// Unlisten strips cancellation from the parent context to ensure it runs:
+		if err := s.notifier.unlisten(context.WithoutCancel(ctx), s); err != nil {
 			s.notifier.Logger.ErrorContext(ctx, s.notifier.Name+": Error unlistening on topic", "err", err, "topic", s.topic)
 		}
 	})
@@ -44,9 +45,9 @@ func (s *Subscription) Unlisten(ctx context.Context) {
 
 // Test-only properties.
 type notifierTestSignals struct {
-	BackoffError   rivercommon.TestSignal[error]    // non-cancellation error received by main run loop
-	ListeningBegin rivercommon.TestSignal[struct{}] // notifier has entered a listen loop
-	ListeningEnd   rivercommon.TestSignal[struct{}] // notifier has left a listen loop
+	BackoffError   testsignal.TestSignal[error]    // non-cancellation error received by main run loop
+	ListeningBegin testsignal.TestSignal[struct{}] // notifier has entered a listen loop
+	ListeningEnd   testsignal.TestSignal[struct{}] // notifier has left a listen loop
 }
 
 func (ts *notifierTestSignals) Init() {
@@ -126,12 +127,12 @@ func (n *Notifier) Start(ctx context.Context) error {
 					break
 				}
 
-				sleepDuration := n.ExponentialBackoff(attempt, baseservice.MaxAttemptsBeforeResetDefault)
+				sleepDuration := serviceutil.ExponentialBackoff(attempt, serviceutil.MaxAttemptsBeforeResetDefault)
 				n.Logger.ErrorContext(ctx, n.Name+": Error running listener (will attempt reconnect after backoff)",
 					"attempt", attempt, "err", err, "sleep_duration", sleepDuration)
 				n.testSignals.BackoffError.Signal(err)
 				if !n.disableSleep {
-					n.CancellableSleep(ctx, sleepDuration)
+					serviceutil.CancellableSleep(ctx, sleepDuration)
 				}
 			}
 		}
@@ -318,7 +319,7 @@ func (n *Notifier) listenerUnlisten(ctx context.Context, topic NotificationTopic
 func (n *Notifier) waitOnce(ctx context.Context) error {
 	n.withLock(func() {
 		n.isWaiting = true
-		ctx, n.waitCancel = context.WithCancel(ctx)
+		ctx, n.waitCancel = context.WithCancel(ctx) //nolint:fatcontext
 	})
 	defer n.withLock(func() {
 		n.isWaiting = false

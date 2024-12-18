@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -97,8 +98,8 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 		return driver.UnwrapExecutor(tx), &testBundle{}
 	}
 
-	makeInsertParams := func() *riverdriver.JobInsertFastParams {
-		return &riverdriver.JobInsertFastParams{
+	makeInsertParams := func() []*riverdriver.JobInsertFastParams {
+		return []*riverdriver.JobInsertFastParams{{
 			EncodedArgs: []byte(`{}`),
 			Kind:        "fake_job",
 			MaxAttempts: rivercommon.MaxAttemptsDefault,
@@ -107,7 +108,7 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 			Queue:       rivercommon.QueueDefault,
 			ScheduledAt: nil,
 			State:       rivertype.JobStateAvailable,
-		}
+		}}
 	}
 
 	b.Run("JobInsert_Sequential", func(b *testing.B) {
@@ -117,7 +118,7 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 		exec, _ := setupTx(b)
 
 		for i := 0; i < b.N; i++ {
-			if _, err := exec.JobInsertFast(ctx, makeInsertParams()); err != nil {
+			if _, err := exec.JobInsertFastMany(ctx, makeInsertParams()); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -132,7 +133,7 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			i := 0
 			for pb.Next() {
-				if _, err := exec.JobInsertFast(ctx, makeInsertParams()); err != nil {
+				if _, err := exec.JobInsertFastMany(ctx, makeInsertParams()); err != nil {
 					b.Fatal(err)
 				}
 				i++
@@ -147,7 +148,7 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 		exec, _ := setupTx(b)
 
 		for i := 0; i < b.N*100; i++ {
-			if _, err := exec.JobInsertFast(ctx, makeInsertParams()); err != nil {
+			if _, err := exec.JobInsertFastMany(ctx, makeInsertParams()); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -172,7 +173,7 @@ func BenchmarkDriverRiverPgxV5_Executor(b *testing.B) {
 		exec, _ := setupPool(b)
 
 		for i := 0; i < b.N*100*runtime.NumCPU(); i++ {
-			if _, err := exec.JobInsertFast(ctx, makeInsertParams()); err != nil {
+			if _, err := exec.JobInsertFastMany(ctx, makeInsertParams()); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -217,36 +218,36 @@ func BenchmarkDriverRiverPgxV5Insert(b *testing.B) {
 		return driver, bundle
 	}
 
-	b.Run("InsertFast", func(b *testing.B) {
+	b.Run("InsertFastMany", func(b *testing.B) {
 		_, bundle := setup(b)
 
 		for n := 0; n < b.N; n++ {
-			_, err := bundle.exec.JobInsertFast(ctx, &riverdriver.JobInsertFastParams{
+			_, err := bundle.exec.JobInsertFastMany(ctx, []*riverdriver.JobInsertFastParams{{
 				EncodedArgs: []byte(`{"encoded": "args"}`),
 				Kind:        "test_kind",
 				MaxAttempts: rivercommon.MaxAttemptsDefault,
 				Priority:    rivercommon.PriorityDefault,
 				Queue:       rivercommon.QueueDefault,
 				State:       rivertype.JobStateAvailable,
-			})
+			}})
 			require.NoError(b, err)
 		}
 	})
 
-	b.Run("InsertUnique", func(b *testing.B) {
+	b.Run("InsertFastMany_WithUnique", func(b *testing.B) {
 		_, bundle := setup(b)
 
-		for n := 0; n < b.N; n++ {
-			_, err := bundle.exec.JobInsertUnique(ctx, &riverdriver.JobInsertUniqueParams{
-				JobInsertFastParams: &riverdriver.JobInsertFastParams{
-					EncodedArgs: []byte(`{"encoded": "args"}`),
-					Kind:        "test_kind",
-					MaxAttempts: rivercommon.MaxAttemptsDefault,
-					Priority:    rivercommon.PriorityDefault,
-					Queue:       rivercommon.QueueDefault,
-					State:       rivertype.JobStateAvailable,
-				},
-			})
+		for i := 0; i < b.N; i++ {
+			_, err := bundle.exec.JobInsertFastMany(ctx, []*riverdriver.JobInsertFastParams{{
+				EncodedArgs:  []byte(`{"encoded": "args"}`),
+				Kind:         "test_kind",
+				MaxAttempts:  rivercommon.MaxAttemptsDefault,
+				Priority:     rivercommon.PriorityDefault,
+				Queue:        rivercommon.QueueDefault,
+				State:        rivertype.JobStateAvailable,
+				UniqueKey:    []byte("test_unique_key_" + strconv.Itoa(i)),
+				UniqueStates: 0xFB,
+			}})
 			require.NoError(b, err)
 		}
 	})

@@ -8,6 +8,8 @@ import (
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/util/maputil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/serviceutil"
 )
 
 const (
@@ -47,7 +49,7 @@ type QueueMaintainer struct {
 func NewQueueMaintainer(archetype *baseservice.Archetype, services []startstop.Service) *QueueMaintainer {
 	servicesByName := make(map[string]startstop.Service, len(services))
 	for _, service := range services {
-		servicesByName[reflect.TypeOf(service).Elem().Name()] = service
+		servicesByName[serviceName(service)] = service
 	}
 	return baseservice.Init(archetype, &QueueMaintainer{
 		servicesByName: servicesByName,
@@ -97,7 +99,12 @@ func (m *QueueMaintainer) Start(ctx context.Context) error {
 // reflection and potential for panics.
 func GetService[T startstop.Service](maintainer *QueueMaintainer) T {
 	var kindPtr T
-	return maintainer.servicesByName[reflect.TypeOf(kindPtr).Elem().Name()].(T) //nolint:forcetypeassert
+	return maintainer.servicesByName[serviceName(kindPtr)].(T) //nolint:forcetypeassert
+}
+
+func serviceName(service startstop.Service) string {
+	elem := reflect.TypeOf(service).Elem()
+	return elem.PkgPath() + "." + elem.Name()
 }
 
 // queueMaintainerServiceBase is a struct that should be embedded on all queue
@@ -116,7 +123,7 @@ func (s *queueMaintainerServiceBase) StaggerStart(ctx context.Context) {
 		return
 	}
 
-	s.CancellableSleepRandomBetween(ctx, 0*time.Second, 1*time.Second)
+	serviceutil.CancellableSleep(ctx, randutil.DurationBetween(0*time.Second, 1*time.Second))
 }
 
 // StaggerStartupDisable sets whether the short staggered sleep on start up
@@ -131,7 +138,7 @@ func (s *queueMaintainerServiceBase) StaggerStartupIsDisabled() bool {
 }
 
 // withStaggerStartupDisable is an interface to a service whose stagger startup
-// sleep can be disable.
+// sleep can be disabled.
 type withStaggerStartupDisable interface {
 	// StaggerStartupDisable sets whether the short staggered sleep on start up
 	// is disabled. This is useful in tests where the extra sleep involved in a

@@ -7,15 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2024-12-26
+
+### Added
+
+- The River CLI will now respect the standard set of `PG*` environment variables like `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, and `PGSSLMODE` to configure a target database when the `--database-url` parameter is omitted. [PR #702](https://github.com/riverqueue/river/pull/702).
+- Add missing doc for `JobRow.UniqueStates` + reveal `rivertype.UniqueOptsByStateDefault()` to provide access to the default set of unique job states. [PR #707](https://github.com/riverqueue/river/pull/707).
+
+### Changed
+
+- Sleep durations are now logged as Go-like duration strings (e.g. "10s") in either text or JSON instead of duration strings in text and nanoseconds in JSON. [PR #699](https://github.com/riverqueue/river/pull/699).
+- Altered the migration comments from `river migrate-get` to include the "line" of the migration being run (`main`, or for River Pro `workflow` and `sequence`) to make them more distinguishable. [PR #703](https://github.com/riverqueue/river/pull/703).
+- Fewer slice allocations during unique insertions. [PR #705](https://github.com/riverqueue/river/pull/705).
+
+### Fixed
+
+- Exponential backoffs at degenerately high job attempts (>= 310) no longer risk overflowing `time.Duration`. [PR #698](https://github.com/riverqueue/river/pull/698).
+
 ## [0.14.3] - 2024-12-14
 
 ### Changed
 
-- Dropped internal random generators in favor of `math/rand/v2`, which will have the effect of making code fully incompatible with Go 1.21 (`go.mod` has specified a minimum of 1.22 for some time already though). [PR #690](https://github.com/riverqueue/river/pull/690).
+- Dropped internal random generators in favor of `math/rand/v2`, which will have the effect of making code fully incompatible with Go 1.21 (`go.mod` has specified a minimum of 1.22 for some time already though). [PR #691](https://github.com/riverqueue/river/pull/691).
 
 ### Fixed
 
-- 006 migration now tolerates previous existence of a `unique_states` column in case it was added separately so that the new index could be raised with `CONCURRENTLY`. [PR #691](https://github.com/riverqueue/river/pull/691).
+- 006 migration now tolerates previous existence of a `unique_states` column in case it was added separately so that the new index could be raised with `CONCURRENTLY`. [PR #690](https://github.com/riverqueue/river/pull/690).
 
 ## [0.14.2] - 2024-11-16
 

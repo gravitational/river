@@ -6,13 +6,13 @@ toolchain go1.23.0
 
 require (
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
-	github.com/jackc/pgx/v5 v5.7.1
+	github.com/jackc/pgx/v5 v5.7.2
 	github.com/jackc/puddle/v2 v2.2.2
-	github.com/riverqueue/river/riverdriver v0.14.3
-	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.14.3
-	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.14.3
-	github.com/riverqueue/river/rivershared v0.14.3
-	github.com/riverqueue/river/rivertype v0.14.3
+	github.com/riverqueue/river/riverdriver v0.15.0
+	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.15.0
+	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.15.0
+	github.com/riverqueue/river/rivershared v0.15.0
+	github.com/riverqueue/river/rivertype v0.15.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/gjson v1.18.0
@@ -30,7 +30,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
-	golang.org/x/crypto v0.27.0 // indirect
+	golang.org/x/crypto v0.31.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 

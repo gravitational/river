@@ -84,8 +84,9 @@ type InsertOpts struct {
 //
 // When the options struct is uninitialized (its zero value) no uniqueness at is
 // enforced. As each property is initialized, it's added as a dimension on the
-// uniqueness matrix, and with any property on, the job's kind always counts
-// toward uniqueness.
+// uniqueness matrix. When any property has a non-zero value specified, the
+// job's kind automatically counts toward uniqueness, but can be excluded by
+// setting ExcludeKind to true.
 //
 // So for example, if only ByQueue is on, then for the given job kind, only a
 // single instance is allowed in any given queue, regardless of other properties
@@ -145,6 +146,10 @@ type UniqueOpts struct {
 	//
 	// 	ByState: []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted, rivertype.JobStatePending, rivertype.JobStateRunning, rivertype.JobStateRetryable, rivertype.JobStateScheduled}
 	//
+	// Or more succinctly:
+	//
+	// 	ByState: rivertype.UniqueOptsByStateDefault()
+	//
 	// With this setting, any jobs of the same kind that have been completed or
 	// discarded, but not yet cleaned out by the system, will still prevent a
 	// duplicate unique job from being inserted. For example, with the default
@@ -184,6 +189,13 @@ func (o *UniqueOpts) isEmpty() bool {
 
 var jobStateAll = rivertype.JobStates() //nolint:gochecknoglobals
 
+var requiredV3states = []rivertype.JobState{ //nolint:gochecknoglobals
+	rivertype.JobStateAvailable,
+	rivertype.JobStatePending,
+	rivertype.JobStateRunning,
+	rivertype.JobStateScheduled,
+}
+
 func (o *UniqueOpts) validate() error {
 	if o.isEmpty() {
 		return nil
@@ -209,13 +221,7 @@ func (o *UniqueOpts) validate() error {
 		return nil
 	}
 
-	requiredV3states := []rivertype.JobState{
-		rivertype.JobStateAvailable,
-		rivertype.JobStatePending,
-		rivertype.JobStateRunning,
-		rivertype.JobStateScheduled,
-	}
-	missingStates := []string{}
+	var missingStates []string
 	for _, state := range requiredV3states {
 		if !slices.Contains(o.ByState, state) {
 			missingStates = append(missingStates, string(state))

@@ -18,7 +18,7 @@ const (
 	ReindexerTimeoutDefault  = 15 * time.Second
 )
 
-var defaultIndexNames = []string{} //nolint:gochecknoglobals
+var defaultIndexNames = []string{"river_job_args_index", "river_job_metadata_index"} //nolint:gochecknoglobals
 
 // Test-only properties.
 type ReindexerTestSignals struct {
@@ -36,6 +36,10 @@ type ReindexerConfig struct {
 	// ScheduleFunc returns the next scheduled run time for the reindexer given the
 	// current time.
 	ScheduleFunc func(time.Time) time.Time
+
+	// Schema where River tables are located. Empty string omits schema, causing
+	// Postgres to default to `search_path`.
+	Schema string
 
 	// Timeout is the amount of time to wait for a single reindex query to return.
 	Timeout time.Duration
@@ -74,7 +78,7 @@ func NewReindexer(archetype *baseservice.Archetype, config *ReindexerConfig, exe
 
 	scheduleFunc := config.ScheduleFunc
 	if scheduleFunc == nil {
-		scheduleFunc = (&defaultReindexerSchedule{}).Next
+		scheduleFunc = (&DefaultReindexerSchedule{}).Next
 	}
 
 	return baseservice.Init(archetype, &Reindexer{
@@ -156,7 +160,12 @@ func (s *Reindexer) reindexOne(ctx context.Context, indexName string) error {
 	ctx, cancel := context.WithTimeout(ctx, s.Config.Timeout)
 	defer cancel()
 
-	_, err := s.exec.Exec(ctx, "REINDEX INDEX CONCURRENTLY "+indexName)
+	var maybeSchema string
+	if s.Config.Schema != "" {
+		maybeSchema = "." + s.Config.Schema
+	}
+
+	_, err := s.exec.Exec(ctx, "REINDEX INDEX CONCURRENTLY "+maybeSchema+indexName)
 	if err != nil {
 		return err
 	}
@@ -165,11 +174,11 @@ func (s *Reindexer) reindexOne(ctx context.Context, indexName string) error {
 	return nil
 }
 
-// defaultReindexerSchedule is a default schedule for the reindexer job which
+// DefaultReindexerSchedule is a default schedule for the reindexer job which
 // runs at midnight UTC daily.
-type defaultReindexerSchedule struct{}
+type DefaultReindexerSchedule struct{}
 
 // Next returns the next scheduled time for the reindexer job.
-func (s *defaultReindexerSchedule) Next(t time.Time) time.Time {
+func (s *DefaultReindexerSchedule) Next(t time.Time) time.Time {
 	return t.Add(24 * time.Hour).Truncate(24 * time.Hour)
 }

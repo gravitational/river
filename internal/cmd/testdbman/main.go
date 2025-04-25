@@ -139,12 +139,9 @@ func createTestDatabases(ctx context.Context, out io.Writer) error {
 		return nil
 	}
 
-	// This is the same default as pgxpool's maximum number of connections
-	// when not specified -- either 4 or the number of CPUs, whichever is
-	// greater. If changing this number, also change the similar value in
-	// `riverinternaltest` where it's duplicated.
-	dbNames := generateTestDBNames(max(4, runtime.NumCPU()))
-
+	// Allow up to one database per concurrent test, plus two for overhead:
+	maxTestDBs := runtime.GOMAXPROCS(0) + 2
+	dbNames := generateTestDBNames(maxTestDBs)
 	for _, dbName := range dbNames {
 		if err := createDBAndMigrate(dbName); err != nil {
 			return err
@@ -160,7 +157,7 @@ func generateTestDBNames(numDBs int) []string {
 		"river_test_example",
 	}
 
-	for i := 0; i < numDBs; i++ {
+	for i := range numDBs {
 		dbNames = append(dbNames, fmt.Sprintf("river_test_%d", i))
 	}
 

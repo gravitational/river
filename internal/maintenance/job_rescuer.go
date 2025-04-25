@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/riverqueue/river/internal/jobexecutor"
 	"github.com/riverqueue/river/internal/workunit"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
@@ -26,10 +27,6 @@ const (
 	JobRescuerIntervalDefault    = 30 * time.Second
 )
 
-type ClientRetryPolicy interface {
-	NextRetry(job *rivertype.JobRow) time.Time
-}
-
 // Test-only properties.
 type JobRescuerTestSignals struct {
 	FetchedBatch testsignal.TestSignal[struct{}] // notifies when runOnce has fetched a batch of jobs
@@ -44,7 +41,7 @@ func (ts *JobRescuerTestSignals) Init() {
 type JobRescuerConfig struct {
 	// ClientRetryPolicy is the default retry policy to use for workers that don't
 	// override NextRetry.
-	ClientRetryPolicy ClientRetryPolicy
+	ClientRetryPolicy jobexecutor.ClientRetryPolicy
 
 	// Interval is the amount of time to wait between runs of the rescuer.
 	Interval time.Duration
@@ -52,6 +49,10 @@ type JobRescuerConfig struct {
 	// RescueAfter is the amount of time for a job to be active before it is
 	// considered stuck and should be rescued.
 	RescueAfter time.Duration
+
+	// Schema where River tables are located. Empty string omits schema, causing
+	// Postgres to default to `search_path`.
+	Schema string
 
 	WorkUnitFactoryFunc func(kind string) workunit.WorkUnitFactory
 }
@@ -172,6 +173,7 @@ func (s *JobRescuer) runOnce(ctx context.Context) (*rescuerRunOnceResult, error)
 			Error:       make([][]byte, 0, len(stuckJobs)),
 			FinalizedAt: make([]time.Time, 0, len(stuckJobs)),
 			ScheduledAt: make([]time.Time, 0, len(stuckJobs)),
+			Schema:      s.Config.Schema,
 			State:       make([]string, 0, len(stuckJobs)),
 		}
 
@@ -250,6 +252,7 @@ func (s *JobRescuer) getStuckJobs(ctx context.Context) ([]*rivertype.JobRow, err
 
 	return s.exec.JobGetStuck(ctx, &riverdriver.JobGetStuckParams{
 		Max:          s.batchSize,
+		Schema:       s.Config.Schema,
 		StuckHorizon: stuckHorizon,
 	})
 }

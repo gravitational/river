@@ -90,16 +90,31 @@ func TestQueueCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		var err error
-		_, err = bundle.exec.QueueGet(ctx, queue1.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue1.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.NoError(t, err) // still there
-		_, err = bundle.exec.QueueGet(ctx, queue2.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue2.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.NoError(t, err) // still there
 
-		_, err = bundle.exec.QueueGet(ctx, queue3.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue3.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.ErrorIs(t, err, rivertype.ErrNotFound) // still there
-		_, err = bundle.exec.QueueGet(ctx, queue4.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue4.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.ErrorIs(t, err, rivertype.ErrNotFound) // still there
-		_, err = bundle.exec.QueueGet(ctx, queue5.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue5.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.ErrorIs(t, err, rivertype.ErrNotFound) // still there
 	})
 
@@ -115,7 +130,7 @@ func TestQueueCleaner(t *testing.T) {
 
 		queues := make([]*rivertype.Queue, numQueues)
 
-		for i := 0; i < numQueues; i++ {
+		for i := range numQueues {
 			queue := testfactory.Queue(ctx, t, bundle.exec, &testfactory.QueueOpts{
 				Name:      ptrutil.Ptr(fmt.Sprintf("queue%d", i)),
 				UpdatedAt: ptrutil.Ptr(bundle.deleteHorizon.Add(-25 * time.Hour)),
@@ -130,7 +145,10 @@ func TestQueueCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		for _, queue := range queues {
-			_, err := bundle.exec.QueueGet(ctx, queue.Name)
+			_, err := bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+				Name:   queue.Name,
+				Schema: cleaner.Config.Schema,
+			})
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 		}
 	})
@@ -144,7 +162,7 @@ func TestQueueCleaner(t *testing.T) {
 		require.NoError(t, cleaner.Start(ctx))
 
 		// This should trigger ~immediately every time:
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			t.Logf("Iteration %d", i)
 			cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 		}
@@ -200,9 +218,15 @@ func TestQueueCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		var err error
-		_, err = bundle.exec.QueueGet(ctx, queue1.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue1.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.QueueGet(ctx, queue2.Name)
+		_, err = bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+			Name:   queue2.Name,
+			Schema: cleaner.Config.Schema,
+		})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
 	})
 }

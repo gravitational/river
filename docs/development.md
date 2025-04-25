@@ -25,7 +25,7 @@ queries. After changing an sqlc `.sql` file, generate Go with:
 
 ## Releasing a new version
 
-1. Fetch changes to the repo and any new tags. Export `VERSION` by incrementing the last tag. Execute `update-submodule-versions` to add it the project's `go.mod` files:
+1. Fetch changes to the repo and any new tags. Export `VERSION` by incrementing the last tag. Execute `update-mod-version` to add it the project's `go.mod` files:
 
     ```shell
     git checkout master && git pull --rebase
@@ -39,8 +39,8 @@ queries. After changing an sqlc `.sql` file, generate Go with:
 3. Upon merge, pull down the changes, tag each module with the new version, and push the new tags:
 
     ```shell
+    git checkout master && git pull --rebase
     git tag cmd/river/$VERSION -m "release cmd/river/$VERSION"
-    git pull origin master
     git tag riverdriver/$VERSION -m "release riverdriver/$VERSION"
     git tag riverdriver/riverpgxv5/$VERSION -m "release riverdriver/riverpgxv5/$VERSION"
     git tag riverdriver/riverdatabasesql/$VERSION -m "release riverdriver/riverdatabasesql/$VERSION"

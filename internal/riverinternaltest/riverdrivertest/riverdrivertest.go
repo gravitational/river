@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"golang.org/x/text/cases"
@@ -82,12 +85,12 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			{
 				job := testfactory.Job(ctx, t, tx, &testfactory.JobOpts{})
 
-				_, err = tx.JobGetByID(ctx, job.ID)
+				_, err := tx.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 				require.NoError(t, err)
 
 				require.NoError(t, tx.Rollback(ctx))
 
-				_, err = exec.JobGetByID(ctx, job.ID)
+				_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 				require.ErrorIs(t, err, rivertype.ErrNotFound)
 			}
 		})
@@ -114,16 +117,16 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					{
 						job2 := testfactory.Job(ctx, t, tx2, &testfactory.JobOpts{})
 
-						_, err = tx2.JobGetByID(ctx, job2.ID)
+						_, err := tx2.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 						require.NoError(t, err)
 
 						require.NoError(t, tx2.Rollback(ctx))
 
-						_, err = tx1.JobGetByID(ctx, job2.ID)
+						_, err = tx1.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 						require.ErrorIs(t, err, rivertype.ErrNotFound)
 					}
 
-					_, err = tx1.JobGetByID(ctx, job1.ID)
+					_, err = tx1.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 					require.NoError(t, err)
 				}
 
@@ -137,22 +140,22 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					{
 						job2 := testfactory.Job(ctx, t, tx2, &testfactory.JobOpts{})
 
-						_, err = tx2.JobGetByID(ctx, job2.ID)
+						_, err = tx2.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 						require.NoError(t, err)
 
 						require.NoError(t, tx2.Rollback(ctx))
 
-						_, err = tx1.JobGetByID(ctx, job2.ID)
+						_, err = tx1.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 						require.ErrorIs(t, err, rivertype.ErrNotFound)
 					}
 
-					_, err = tx1.JobGetByID(ctx, job1.ID)
+					_, err = tx1.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 					require.NoError(t, err)
 				}
 
 				require.NoError(t, tx1.Rollback(ctx))
 
-				_, err = exec.JobGetByID(ctx, job1.ID)
+				_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 				require.ErrorIs(t, err, rivertype.ErrNotFound)
 			}
 		})
@@ -177,7 +180,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// Despite rollback being called after commit, the job is still
 			// visible from the outer transaction.
-			_, err = tx1.JobGetByID(ctx, job.ID)
+			_, err = tx1.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 		})
 	})
@@ -187,15 +190,24 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 		exec, _ := setup(ctx, t)
 
-		exists, err := exec.ColumnExists(ctx, "river_job", "id")
+		exists, err := exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{
+			Column: "id",
+			Table:  "river_job",
+		})
 		require.NoError(t, err)
 		require.True(t, exists)
 
-		exists, err = exec.ColumnExists(ctx, "river_job", "does_not_exist")
+		exists, err = exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{
+			Column: "does_not_exist",
+			Table:  "river_job",
+		})
 		require.NoError(t, err)
 		require.False(t, exists)
 
-		exists, err = exec.ColumnExists(ctx, "does_not_exist", "id")
+		exists, err = exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{
+			Column: "id",
+			Table:  "does_not_exist",
+		})
 		require.NoError(t, err)
 		require.False(t, exists)
 
@@ -211,7 +223,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		_, err = exec.Exec(ctx, "CREATE TABLE river_job (another_id bigint)")
 		require.NoError(t, err)
 
-		exists, err = exec.ColumnExists(ctx, "river_job", "id")
+		exists, err = exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{
+			Column: "id",
+			Table:  "river_job",
+		})
 		require.NoError(t, err)
 		require.False(t, exists)
 	})
@@ -233,8 +248,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			rivertype.JobStateRetryable,
 			rivertype.JobStateScheduled,
 		} {
-			startingState := startingState
-
 			t.Run(fmt.Sprintf("CancelsJobIn%sState", startingState), func(t *testing.T) {
 				t.Parallel()
 
@@ -295,8 +308,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			rivertype.JobStateCompleted,
 			rivertype.JobStateDiscarded,
 		} {
-			startingState := startingState
-
 			t.Run(fmt.Sprintf("DoesNotAlterFinalizedJobIn%sState", startingState), func(t *testing.T) {
 				t.Parallel()
 
@@ -337,21 +348,39 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	t.Run("JobCountByState", func(t *testing.T) {
 		t.Parallel()
 
-		exec, _ := setup(ctx, t)
+		t.Run("CountsJobsByState", func(t *testing.T) {
+			t.Parallel()
 
-		// Included because they're the queried state.
-		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)})
-		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)})
+			exec, _ := setup(ctx, t)
 
-		// Excluded because they're not.
-		finalizedAt := ptrutil.Ptr(time.Now())
-		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateCancelled)})
-		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateCompleted)})
-		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateDiscarded)})
+			// Included because they're the queried state.
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)})
 
-		numJobs, err := exec.JobCountByState(ctx, rivertype.JobStateAvailable)
-		require.NoError(t, err)
-		require.Equal(t, 2, numJobs)
+			// Excluded because they're not.
+			finalizedAt := ptrutil.Ptr(time.Now())
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateCancelled)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateCompleted)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: finalizedAt, State: ptrutil.Ptr(rivertype.JobStateDiscarded)})
+
+			numJobs, err := exec.JobCountByState(ctx, &riverdriver.JobCountByStateParams{
+				State: rivertype.JobStateAvailable,
+			})
+			require.NoError(t, err)
+			require.Equal(t, 2, numJobs)
+		})
+
+		t.Run("AlternateSchema", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			_, err := exec.JobCountByState(ctx, &riverdriver.JobCountByStateParams{
+				Schema: "custom_schema",
+				State:  rivertype.JobStateAvailable,
+			})
+			requireMissingRelation(t, err, "custom_schema.river_job")
+		})
 	})
 
 	t.Run("JobDelete", func(t *testing.T) {
@@ -366,11 +395,13 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				State: ptrutil.Ptr(rivertype.JobStateRunning),
 			})
 
-			jobAfter, err := exec.JobDelete(ctx, job.ID)
+			jobAfter, err := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{
+				ID: job.ID,
+			})
 			require.ErrorIs(t, err, rivertype.ErrJobRunning)
 			require.Nil(t, jobAfter)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRunning, jobUpdated.State)
 		})
@@ -384,8 +415,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			rivertype.JobStateRetryable,
 			rivertype.JobStateScheduled,
 		} {
-			state := state
-
 			t.Run(fmt.Sprintf("DeletesA_%s_Job", state), func(t *testing.T) {
 				t.Parallel()
 
@@ -410,13 +439,16 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					State:       &state,
 				})
 
-				jobAfter, err := exec.JobDelete(ctx, job.ID)
+				jobAfter, err := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{
+					ID:     job.ID,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.NotNil(t, jobAfter)
 				require.Equal(t, job.ID, jobAfter.ID)
 				require.Equal(t, state, jobAfter.State)
 
-				_, err = exec.JobGetByID(ctx, job.ID)
+				_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 				require.ErrorIs(t, err, rivertype.ErrNotFound)
 			})
 		}
@@ -426,9 +458,25 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			exec, _ := setup(ctx, t)
 
-			jobAfter, err := exec.JobDelete(ctx, 1234567890)
+			jobAfter, err := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{
+				ID: 1234567890,
+			})
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 			require.Nil(t, jobAfter)
+		})
+
+		t.Run("AlternateSchema", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
+
+			_, err := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{
+				ID:     job.ID,
+				Schema: "custom_schema",
+			})
+			requireMissingRelation(t, err, "custom_schema.river_job")
 		})
 	})
 
@@ -475,19 +523,19 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		require.Equal(t, 1, numDeleted)
 
 		// All deleted.
-		_, err = exec.JobGetByID(ctx, deletedJob1.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: deletedJob1.ID, Schema: ""})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = exec.JobGetByID(ctx, deletedJob2.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: deletedJob2.ID, Schema: ""})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = exec.JobGetByID(ctx, deletedJob3.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: deletedJob3.ID, Schema: ""})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
 
 		// Not deleted
-		_, err = exec.JobGetByID(ctx, notDeletedJob1.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: notDeletedJob1.ID, Schema: ""})
 		require.NoError(t, err)
-		_, err = exec.JobGetByID(ctx, notDeletedJob2.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: notDeletedJob2.ID, Schema: ""})
 		require.NoError(t, err)
-		_, err = exec.JobGetByID(ctx, notDeletedJob3.ID)
+		_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: notDeletedJob3.ID, Schema: ""})
 		require.NoError(t, err)
 	})
 
@@ -502,9 +550,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
 
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         100,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      100,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Len(t, jobRows, 1)
@@ -523,9 +571,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// Two rows inserted but only one found because of the added limit.
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         1,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      1,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Len(t, jobRows, 1)
@@ -542,9 +590,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// Job is in a non-default queue so it's not found.
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         100,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      100,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Empty(t, jobRows)
@@ -561,9 +609,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// Job is scheduled a while from now so it's not found.
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         100,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      100,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Empty(t, jobRows)
@@ -585,10 +633,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			})
 
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         100,
-				Now:         ptrutil.Ptr(now),
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      100,
+				Now:      ptrutil.Ptr(now),
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Len(t, jobRows, 1)
@@ -608,9 +656,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			}
 
 			jobRows, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         2,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      2,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.Len(t, jobRows, 2, "expected to fetch exactly 2 jobs")
@@ -627,9 +675,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// Should fetch the one remaining job on the next attempt:
 			jobRows, err = exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-				AttemptedBy: clientID,
-				Max:         1,
-				Queue:       rivercommon.QueueDefault,
+				ClientID: clientID,
+				Max:      1,
+				Queue:    rivercommon.QueueDefault,
 			})
 			require.NoError(t, err)
 			require.NoError(t, err)
@@ -650,7 +698,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
 
-			fetchedJob, err := exec.JobGetByID(ctx, job.ID)
+			fetchedJob, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.NotNil(t, fetchedJob)
 
@@ -665,7 +713,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			exec, _ := setup(ctx, t)
 
-			job, err := exec.JobGetByID(ctx, 0)
+			job, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: 0, Schema: ""})
 			require.Error(t, err)
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 			require.Nil(t, job)
@@ -683,142 +731,12 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		// Not returned.
 		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
 
-		jobs, err := exec.JobGetByIDMany(ctx, []int64{job1.ID, job2.ID})
+		jobs, err := exec.JobGetByIDMany(ctx, &riverdriver.JobGetByIDManyParams{
+			ID: []int64{job1.ID, job2.ID},
+		})
 		require.NoError(t, err)
 		require.Equal(t, []int64{job1.ID, job2.ID},
 			sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID }))
-	})
-
-	t.Run("JobGetByKindAndUniqueProperties", func(t *testing.T) {
-		t.Parallel()
-
-		const uniqueJobKind = "unique_job_kind"
-
-		t.Run("NoOptions", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind)})
-			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr("other_kind")})
-
-			fetchedJob, err := exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind: uniqueJobKind,
-			})
-			require.NoError(t, err)
-			require.Equal(t, job.ID, fetchedJob.ID)
-
-			_, err = exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind: "does_not_exist",
-			})
-			require.ErrorIs(t, err, rivertype.ErrNotFound)
-		})
-
-		t.Run("ByArgs", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			args := []byte(`{"unique": "args"}`)
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), EncodedArgs: args})
-			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), EncodedArgs: []byte(`{"other": "args"}`)})
-
-			fetchedJob, err := exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:   uniqueJobKind,
-				ByArgs: true,
-				Args:   args,
-			})
-			require.NoError(t, err)
-			require.Equal(t, job.ID, fetchedJob.ID)
-
-			_, err = exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:   uniqueJobKind,
-				ByArgs: true,
-				Args:   []byte(`{"does_not_exist": "args"}`),
-			})
-			require.ErrorIs(t, err, rivertype.ErrNotFound)
-		})
-
-		t.Run("ByCreatedAt", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			createdAt := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), CreatedAt: &createdAt})
-			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), CreatedAt: ptrutil.Ptr(createdAt.Add(10 * time.Minute))})
-
-			fetchedJob, err := exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:           uniqueJobKind,
-				ByCreatedAt:    true,
-				CreatedAtBegin: createdAt.Add(-5 * time.Minute),
-				CreatedAtEnd:   createdAt.Add(5 * time.Minute),
-			})
-			require.NoError(t, err)
-			require.Equal(t, job.ID, fetchedJob.ID)
-
-			_, err = exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:           uniqueJobKind,
-				ByCreatedAt:    true,
-				CreatedAtBegin: createdAt.Add(-15 * time.Minute),
-				CreatedAtEnd:   createdAt.Add(-5 * time.Minute),
-			})
-			require.ErrorIs(t, err, rivertype.ErrNotFound)
-		})
-
-		t.Run("ByQueue", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			const queue = "unique_queue"
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), Queue: ptrutil.Ptr(queue)})
-			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), Queue: ptrutil.Ptr("other_queue")})
-
-			fetchedJob, err := exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:    uniqueJobKind,
-				ByQueue: true,
-				Queue:   queue,
-			})
-			require.NoError(t, err)
-			require.Equal(t, job.ID, fetchedJob.ID)
-
-			_, err = exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:    uniqueJobKind,
-				ByQueue: true,
-				Queue:   "does_not_exist",
-			})
-			require.ErrorIs(t, err, rivertype.ErrNotFound)
-		})
-
-		t.Run("ByState", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			const state = rivertype.JobStateCompleted
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), FinalizedAt: ptrutil.Ptr(time.Now()), State: ptrutil.Ptr(state)})
-			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr(uniqueJobKind), State: ptrutil.Ptr(rivertype.JobStateRetryable)})
-
-			fetchedJob, err := exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:    uniqueJobKind,
-				ByState: true,
-				State:   []string{string(state)},
-			})
-			require.NoError(t, err)
-			require.Equal(t, job.ID, fetchedJob.ID)
-
-			_, err = exec.JobGetByKindAndUniqueProperties(ctx, &riverdriver.JobGetByKindAndUniquePropertiesParams{
-				Kind:    uniqueJobKind,
-				ByState: true,
-				State:   []string{string(rivertype.JobStateScheduled)},
-			})
-			require.ErrorIs(t, err, rivertype.ErrNotFound)
-		})
 	})
 
 	t.Run("JobGetByKindMany", func(t *testing.T) {
@@ -832,7 +750,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		// Not returned.
 		_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr("kind3")})
 
-		jobs, err := exec.JobGetByKindMany(ctx, []string{job1.Kind, job2.Kind})
+		jobs, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{job1.Kind, job2.Kind},
+			Schema: "",
+		})
 		require.NoError(t, err)
 		require.Equal(t, []int64{job1.ID, job2.ID},
 			sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID }))
@@ -875,6 +796,8 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		t.Parallel()
 
 		t.Run("AllArgs", func(t *testing.T) {
+			t.Parallel()
+
 			exec, _ := setup(ctx, t)
 
 			now := time.Now().UTC()
@@ -882,19 +805,24 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			insertParams := make([]*riverdriver.JobInsertFastParams, 10)
 			for i := 0; i < len(insertParams); i++ {
 				insertParams[i] = &riverdriver.JobInsertFastParams{
-					EncodedArgs: []byte(`{"encoded": "args"}`),
-					Kind:        "test_kind",
-					MaxAttempts: rivercommon.MaxAttemptsDefault,
-					Metadata:    []byte(`{"meta": "data"}`),
-					Priority:    rivercommon.PriorityDefault,
-					Queue:       rivercommon.QueueDefault,
-					ScheduledAt: ptrutil.Ptr(now.Add(time.Duration(i) * time.Minute)),
-					State:       rivertype.JobStateAvailable,
-					Tags:        []string{"tag"},
+					CreatedAt:    ptrutil.Ptr(now.Add(time.Duration(i) * 5 * time.Second)),
+					EncodedArgs:  []byte(`{"encoded": "args"}`),
+					Kind:         "test_kind",
+					MaxAttempts:  rivercommon.MaxAttemptsDefault,
+					Metadata:     []byte(`{"meta": "data"}`),
+					Priority:     rivercommon.PriorityDefault,
+					Queue:        rivercommon.QueueDefault,
+					ScheduledAt:  ptrutil.Ptr(now.Add(time.Duration(i) * time.Minute)),
+					State:        rivertype.JobStateAvailable,
+					Tags:         []string{"tag"},
+					UniqueKey:    []byte("unique-key-fast-many-" + strconv.Itoa(i)),
+					UniqueStates: 0xff,
 				}
 			}
 
-			resultRows, err := exec.JobInsertFastMany(ctx, insertParams)
+			resultRows, err := exec.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs: insertParams,
+			})
 			require.NoError(t, err)
 			require.Len(t, resultRows, len(insertParams))
 
@@ -904,49 +832,103 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				require.Equal(t, 0, job.Attempt)
 				require.Nil(t, job.AttemptedAt)
 				require.Empty(t, job.AttemptedBy)
-				require.WithinDuration(t, now, job.CreatedAt, 2*time.Second)
-				require.Equal(t, []byte(`{"encoded": "args"}`), job.EncodedArgs)
+				require.WithinDuration(t, now.Add(time.Duration(i)*5*time.Second), job.CreatedAt, time.Millisecond)
+				require.JSONEq(t, `{"encoded": "args"}`, string(job.EncodedArgs))
 				require.Empty(t, job.Errors)
 				require.Nil(t, job.FinalizedAt)
 				require.Equal(t, "test_kind", job.Kind)
 				require.Equal(t, rivercommon.MaxAttemptsDefault, job.MaxAttempts)
-				require.Equal(t, []byte(`{"meta": "data"}`), job.Metadata)
+				require.JSONEq(t, `{"meta": "data"}`, string(job.Metadata))
 				require.Equal(t, rivercommon.PriorityDefault, job.Priority)
 				require.Equal(t, rivercommon.QueueDefault, job.Queue)
 				requireEqualTime(t, now.Add(time.Duration(i)*time.Minute), job.ScheduledAt)
 				require.Equal(t, rivertype.JobStateAvailable, job.State)
 				require.Equal(t, []string{"tag"}, job.Tags)
+				require.Equal(t, []byte("unique-key-fast-many-"+strconv.Itoa(i)), job.UniqueKey)
+				require.Equal(t, rivertype.JobStates(), job.UniqueStates)
 			}
 		})
 
-		t.Run("MissingScheduledAtDefaultsToNow", func(t *testing.T) {
+		t.Run("MissingValuesDefaultAsExpected", func(t *testing.T) {
+			t.Parallel()
+
 			exec, _ := setup(ctx, t)
 
 			insertParams := make([]*riverdriver.JobInsertFastParams, 10)
 			for i := 0; i < len(insertParams); i++ {
 				insertParams[i] = &riverdriver.JobInsertFastParams{
-					EncodedArgs: []byte(`{"encoded": "args"}`),
-					Kind:        "test_kind",
-					MaxAttempts: rivercommon.MaxAttemptsDefault,
-					Metadata:    []byte(`{"meta": "data"}`),
-					Priority:    rivercommon.PriorityDefault,
-					Queue:       rivercommon.QueueDefault,
-					ScheduledAt: nil, // explicit nil
-					State:       rivertype.JobStateAvailable,
-					Tags:        []string{"tag"},
+					EncodedArgs:  []byte(`{"encoded": "args"}`),
+					Kind:         "test_kind",
+					MaxAttempts:  rivercommon.MaxAttemptsDefault,
+					Metadata:     []byte(`{"meta": "data"}`),
+					Priority:     rivercommon.PriorityDefault,
+					Queue:        rivercommon.QueueDefault,
+					ScheduledAt:  nil, // explicit nil
+					State:        rivertype.JobStateAvailable,
+					Tags:         []string{"tag"},
+					UniqueKey:    nil,  // explicit nil
+					UniqueStates: 0x00, // explicit 0
 				}
 			}
 
-			results, err := exec.JobInsertFastMany(ctx, insertParams)
+			results, err := exec.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs:   insertParams,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, results, len(insertParams))
 
-			jobsAfter, err := exec.JobGetByKindMany(ctx, []string{"test_kind"})
+			jobsAfter, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+				Kind:   []string{"test_kind"},
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, jobsAfter, len(insertParams))
 			for _, job := range jobsAfter {
+				require.WithinDuration(t, time.Now().UTC(), job.CreatedAt, 2*time.Second)
 				require.WithinDuration(t, time.Now().UTC(), job.ScheduledAt, 2*time.Second)
+
+				// UniqueKey and UniqueStates are not set in the insert params, so they should
+				// be nil and an empty slice respectively.
+				require.Nil(t, job.UniqueKey)
+				var emptyJobStates []rivertype.JobState
+				require.Equal(t, emptyJobStates, job.UniqueStates)
 			}
+		})
+
+		t.Run("BinaryNonUTF8UniqueKey", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			uniqueKey := []byte{0x00, 0x01, 0x02}
+			results, err := exec.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs: []*riverdriver.JobInsertFastParams{
+					{
+						EncodedArgs:  []byte(`{"encoded": "args"}`),
+						Kind:         "test_kind",
+						MaxAttempts:  rivercommon.MaxAttemptsDefault,
+						Metadata:     []byte(`{"meta": "data"}`),
+						Priority:     rivercommon.PriorityDefault,
+						Queue:        rivercommon.QueueDefault,
+						ScheduledAt:  nil, // explicit nil
+						State:        rivertype.JobStateAvailable,
+						Tags:         []string{"tag"},
+						UniqueKey:    uniqueKey,
+						UniqueStates: 0xff,
+					},
+				},
+			})
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			require.Equal(t, uniqueKey, results[0].Job.UniqueKey)
+
+			jobs, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+				Kind:   []string{"test_kind"},
+				Schema: "",
+			})
+			require.NoError(t, err)
+			require.Equal(t, uniqueKey, jobs[0].UniqueKey)
 		})
 	})
 
@@ -965,41 +947,87 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			insertParams := make([]*riverdriver.JobInsertFastParams, 10)
 			for i := 0; i < len(insertParams); i++ {
 				insertParams[i] = &riverdriver.JobInsertFastParams{
+					CreatedAt:    ptrutil.Ptr(now.Add(time.Duration(i) * 5 * time.Second)),
+					EncodedArgs:  []byte(`{"encoded": "args"}`),
+					Kind:         "test_kind",
+					MaxAttempts:  rivercommon.MaxAttemptsDefault,
+					Metadata:     []byte(`{"meta": "data"}`),
+					Priority:     rivercommon.PriorityDefault,
+					Queue:        rivercommon.QueueDefault,
+					ScheduledAt:  &now,
+					State:        rivertype.JobStateAvailable,
+					Tags:         []string{"tag"},
+					UniqueKey:    []byte("unique-key-no-returning-" + strconv.Itoa(i)),
+					UniqueStates: 0xff,
+				}
+			}
+
+			count, err := exec.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs:   insertParams,
+				Schema: "",
+			})
+			require.NoError(t, err)
+			require.Len(t, insertParams, count)
+
+			jobsAfter, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+				Kind:   []string{"test_kind"},
+				Schema: "",
+			})
+			require.NoError(t, err)
+			require.Len(t, jobsAfter, len(insertParams))
+			for i, job := range jobsAfter {
+				require.Equal(t, 0, job.Attempt)
+				require.Nil(t, job.AttemptedAt)
+				require.WithinDuration(t, now.Add(time.Duration(i)*5*time.Second), job.CreatedAt, time.Millisecond)
+				require.JSONEq(t, `{"encoded": "args"}`, string(job.EncodedArgs))
+				require.Empty(t, job.Errors)
+				require.Nil(t, job.FinalizedAt)
+				require.Equal(t, "test_kind", job.Kind)
+				require.Equal(t, rivercommon.MaxAttemptsDefault, job.MaxAttempts)
+				require.JSONEq(t, `{"meta": "data"}`, string(job.Metadata))
+				require.Equal(t, rivercommon.PriorityDefault, job.Priority)
+				require.Equal(t, rivercommon.QueueDefault, job.Queue)
+				requireEqualTime(t, now, job.ScheduledAt)
+				require.Equal(t, rivertype.JobStateAvailable, job.State)
+				require.Equal(t, []string{"tag"}, job.Tags)
+				require.Equal(t, []byte("unique-key-no-returning-"+strconv.Itoa(i)), job.UniqueKey)
+			}
+		})
+
+		t.Run("MissingCreatedAtDefaultsToNow", func(t *testing.T) {
+			exec, _ := setup(ctx, t)
+
+			insertParams := make([]*riverdriver.JobInsertFastParams, 10)
+			for i := 0; i < len(insertParams); i++ {
+				insertParams[i] = &riverdriver.JobInsertFastParams{
+					CreatedAt:   nil, // explicit nil
 					EncodedArgs: []byte(`{"encoded": "args"}`),
 					Kind:        "test_kind",
 					MaxAttempts: rivercommon.MaxAttemptsDefault,
 					Metadata:    []byte(`{"meta": "data"}`),
 					Priority:    rivercommon.PriorityDefault,
 					Queue:       rivercommon.QueueDefault,
-					ScheduledAt: &now,
+					ScheduledAt: ptrutil.Ptr(time.Now().UTC()),
 					State:       rivertype.JobStateAvailable,
 					Tags:        []string{"tag"},
 				}
-				insertParams[i].ScheduledAt = &now
 			}
 
-			count, err := exec.JobInsertFastManyNoReturning(ctx, insertParams)
+			count, err := exec.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs:   insertParams,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, insertParams, count)
 
-			jobsAfter, err := exec.JobGetByKindMany(ctx, []string{"test_kind"})
+			jobsAfter, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+				Kind:   []string{"test_kind"},
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, jobsAfter, len(insertParams))
 			for _, job := range jobsAfter {
-				require.Equal(t, 0, job.Attempt)
-				require.Nil(t, job.AttemptedAt)
 				require.WithinDuration(t, time.Now().UTC(), job.CreatedAt, 2*time.Second)
-				require.Equal(t, []byte(`{"encoded": "args"}`), job.EncodedArgs)
-				require.Empty(t, job.Errors)
-				require.Nil(t, job.FinalizedAt)
-				require.Equal(t, "test_kind", job.Kind)
-				require.Equal(t, rivercommon.MaxAttemptsDefault, job.MaxAttempts)
-				require.Equal(t, []byte(`{"meta": "data"}`), job.Metadata)
-				require.Equal(t, rivercommon.PriorityDefault, job.Priority)
-				require.Equal(t, rivercommon.QueueDefault, job.Queue)
-				requireEqualTime(t, now, job.ScheduledAt)
-				require.Equal(t, rivertype.JobStateAvailable, job.State)
-				require.Equal(t, []string{"tag"}, job.Tags)
 			}
 		})
 
@@ -1021,11 +1049,17 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				}
 			}
 
-			count, err := exec.JobInsertFastManyNoReturning(ctx, insertParams)
+			count, err := exec.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+				Jobs:   insertParams,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, insertParams, count)
 
-			jobsAfter, err := exec.JobGetByKindMany(ctx, []string{"test_kind"})
+			jobsAfter, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+				Kind:   []string{"test_kind"},
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Len(t, jobsAfter, len(insertParams))
 			for _, job := range jobsAfter {
@@ -1054,7 +1088,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.Equal(t, 0, job.Attempt)
 			require.Nil(t, job.AttemptedAt)
 			require.WithinDuration(t, time.Now().UTC(), job.CreatedAt, 2*time.Second)
-			require.Equal(t, []byte(`{"encoded": "args"}`), job.EncodedArgs)
+			require.JSONEq(t, `{"encoded": "args"}`, string(job.EncodedArgs))
 			require.Empty(t, job.Errors)
 			require.Nil(t, job.FinalizedAt)
 			require.Equal(t, "test_kind", job.Kind)
@@ -1073,6 +1107,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			job, err := exec.JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
 				Attempt:     3,
 				AttemptedAt: &now,
+				AttemptedBy: []string{"worker1", "worker2"},
 				CreatedAt:   &now,
 				EncodedArgs: []byte(`{"encoded": "args"}`),
 				Errors:      [][]byte{[]byte(`{"error": "message"}`)},
@@ -1090,13 +1125,14 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.Equal(t, 3, job.Attempt)
 			requireEqualTime(t, now, *job.AttemptedAt)
+			require.Equal(t, []string{"worker1", "worker2"}, job.AttemptedBy)
 			requireEqualTime(t, now, job.CreatedAt)
-			require.Equal(t, []byte(`{"encoded": "args"}`), job.EncodedArgs)
+			require.JSONEq(t, `{"encoded": "args"}`, string(job.EncodedArgs))
 			require.Equal(t, "message", job.Errors[0].Error)
 			requireEqualTime(t, now, *job.FinalizedAt)
 			require.Equal(t, "test_kind", job.Kind)
 			require.Equal(t, 6, job.MaxAttempts)
-			require.Equal(t, []byte(`{"meta": "data"}`), job.Metadata)
+			require.JSONEq(t, `{"meta": "data"}`, string(job.Metadata))
 			require.Equal(t, 2, job.Priority)
 			require.Equal(t, "queue_name", job.Queue)
 			requireEqualTime(t, now, job.ScheduledAt)
@@ -1117,8 +1153,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				rivertype.JobStateCompleted,
 				rivertype.JobStateDiscarded,
 			} {
-				state := state // capture range variable
-
 				t.Run(fmt.Sprintf("CannotSetState%sWithoutFinalizedAt", capitalizeJobState(state)), func(t *testing.T) {
 					t.Parallel()
 
@@ -1154,8 +1188,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				rivertype.JobStateRunning,
 				rivertype.JobStateScheduled,
 			} {
-				state := state // capture range variable
-
 				t.Run(fmt.Sprintf("CanSetState%sWithoutFinalizedAt", capitalizeJobState(state)), func(t *testing.T) {
 					t.Parallel()
 
@@ -1209,11 +1241,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueStates: 0xFF,
 			})
 
-			fetchedJobs, err := exec.JobList(
-				ctx,
-				fmt.Sprintf("SELECT %s FROM river_job WHERE id = @job_id_123", exec.JobListFields()),
-				map[string]any{"job_id_123": job.ID},
-			)
+			// Does not match predicate (makes sure where clause is working).
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
+
+			fetchedJobs, err := exec.JobList(ctx, &riverdriver.JobListParams{
+				Max:           100,
+				NamedArgs:     map[string]any{"job_id_123": job.ID},
+				OrderByClause: "id",
+				WhereClause:   "id = @job_id_123",
+			})
 			require.NoError(t, err)
 			require.Len(t, fetchedJobs, 1)
 
@@ -1244,34 +1280,27 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr("test_kind2")})
 
 			{
-				fetchedJobs, err := exec.JobList(
-					ctx,
-					fmt.Sprintf("SELECT %s FROM river_job WHERE kind = @kind", exec.JobListFields()),
-					map[string]any{"kind": job1.Kind},
-				)
+				fetchedJobs, err := exec.JobList(ctx, &riverdriver.JobListParams{
+					Max:           100,
+					NamedArgs:     map[string]any{"kind": job1.Kind},
+					OrderByClause: "id",
+					WhereClause:   "kind = @kind",
+				})
 				require.NoError(t, err)
 				require.Len(t, fetchedJobs, 1)
 			}
 
 			{
-				fetchedJobs, err := exec.JobList(
-					ctx,
-					fmt.Sprintf("SELECT %s FROM river_job WHERE kind = any(@kind::text[])", exec.JobListFields()),
-					map[string]any{"kind": []string{job1.Kind, job2.Kind}},
-				)
+				fetchedJobs, err := exec.JobList(ctx, &riverdriver.JobListParams{
+					Max:           100,
+					NamedArgs:     map[string]any{"kind": []string{job1.Kind, job2.Kind}},
+					OrderByClause: "id",
+					WhereClause:   "kind = any(@kind::text[])",
+				})
 				require.NoError(t, err)
 				require.Len(t, fetchedJobs, 2)
 			}
 		})
-	})
-
-	t.Run("JobListFields", func(t *testing.T) {
-		t.Parallel()
-
-		exec, _ := setup(ctx, t)
-
-		require.Equal(t, "id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states",
-			exec.JobListFields())
 	})
 
 	t.Run("JobRescueMany", func(t *testing.T) {
@@ -1308,14 +1337,14 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		})
 		require.NoError(t, err)
 
-		updatedJob1, err := exec.JobGetByID(ctx, job1.ID)
+		updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 		require.NoError(t, err)
 		require.Equal(t, "message1", updatedJob1.Errors[0].Error)
 		require.Nil(t, updatedJob1.FinalizedAt)
 		requireEqualTime(t, now, updatedJob1.ScheduledAt)
 		require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
 
-		updatedJob2, err := exec.JobGetByID(ctx, job2.ID)
+		updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 		require.NoError(t, err)
 		require.Equal(t, "message2", updatedJob2.Errors[0].Error)
 		requireEqualTime(t, now, *updatedJob2.FinalizedAt)
@@ -1335,12 +1364,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				State: ptrutil.Ptr(rivertype.JobStateRunning),
 			})
 
-			jobAfter, err := exec.JobRetry(ctx, job.ID)
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:     job.ID,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
 			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRunning, jobUpdated.State)
 		})
@@ -1354,8 +1386,6 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			rivertype.JobStateRetryable,
 			rivertype.JobStateScheduled,
 		} {
-			state := state
-
 			t.Run(fmt.Sprintf("UpdatesA_%s_JobToBeScheduledImmediately", state), func(t *testing.T) {
 				t.Parallel()
 
@@ -1380,12 +1410,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					State:       &state,
 				})
 
-				jobAfter, err := exec.JobRetry(ctx, job.ID)
+				jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+					ID:     job.ID,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
 				require.WithinDuration(t, time.Now().UTC(), jobAfter.ScheduledAt, 100*time.Millisecond)
 
-				jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+				jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 				require.NoError(t, err)
 				require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
 				require.Nil(t, jobUpdated.FinalizedAt)
@@ -1410,7 +1443,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				State:       ptrutil.Ptr(rivertype.JobStateCompleted),
 			})
 
-			jobAfter, err := exec.JobRetry(ctx, job.ID)
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:     job.ID,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
 			require.WithinDuration(t, now, jobAfter.ScheduledAt, 5*time.Second)
@@ -1429,12 +1465,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				ScheduledAt: ptrutil.Ptr(now.Add(-1 * time.Hour)),
 			})
 
-			jobAfter, err := exec.JobRetry(ctx, job.ID)
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:     job.ID,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
 			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
 		})
@@ -1444,7 +1483,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			exec, _ := setup(ctx, t)
 
-			_, err := exec.JobRetry(ctx, 0)
+			_, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:     0,
+				Schema: "",
+			})
 			require.Error(t, err)
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 		})
@@ -1491,15 +1533,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.Len(t, result, 1)
 
-			updatedJob1, err := exec.JobGetByID(ctx, job1.ID)
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
 
-			updatedJob2, err := exec.JobGetByID(ctx, job2.ID)
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob2.State)
 
-			updatedJob3, err := exec.JobGetByID(ctx, job3.ID)
+			updatedJob3, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job3.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob3.State)
 		})
@@ -1574,17 +1616,17 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.Len(t, result, 3)
 
-			updatedJob1, err := exec.JobGetByID(ctx, job1.ID)
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateDiscarded, updatedJob1.State)
 			require.Equal(t, "scheduler_discarded", gjson.GetBytes(updatedJob1.Metadata, "unique_key_conflict").String())
 
-			updatedJob2, err := exec.JobGetByID(ctx, job2.ID)
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob2.State)
 			require.False(t, gjson.GetBytes(updatedJob2.Metadata, "unique_key_conflict").Exists())
 
-			updatedJob3, err := exec.JobGetByID(ctx, job3.ID)
+			updatedJob3, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job3.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob3.State)
 			require.False(t, gjson.GetBytes(updatedJob3.Metadata, "unique_key_conflict").Exists())
@@ -1628,189 +1670,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.Len(t, result, 2)
 
-			updatedJob1, err := exec.JobGetByID(ctx, job1.ID)
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
 			require.False(t, gjson.GetBytes(updatedJob1.Metadata, "unique_key_conflict").Exists())
 
-			updatedJob2, err := exec.JobGetByID(ctx, job2.ID)
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateDiscarded, updatedJob2.State)
 			require.Equal(t, "scheduler_discarded", gjson.GetBytes(updatedJob2.Metadata, "unique_key_conflict").String())
-		})
-	})
-
-	t.Run("JobSetCompleteIfRunningMany", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("CompletesRunningJobs", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			finalizedAt1 := time.Now().UTC().Add(-1 * time.Minute)
-			finalizedAt2 := time.Now().UTC().Add(-2 * time.Minute)
-			finalizedAt3 := time.Now().UTC().Add(-3 * time.Minute)
-
-			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-			job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning), UniqueKey: []byte("unique-key")})
-
-			// Running, but won't be completed.
-			otherJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-
-			jobsAfter, err := exec.JobSetCompleteIfRunningMany(ctx, &riverdriver.JobSetCompleteIfRunningManyParams{
-				ID:          []int64{job1.ID, job2.ID, job3.ID},
-				FinalizedAt: []time.Time{finalizedAt1, finalizedAt2, finalizedAt3},
-			})
-			require.NoError(t, err)
-			for _, jobAfter := range jobsAfter {
-				require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
-			}
-
-			job1Updated, err := exec.JobGetByID(ctx, job1.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, job1Updated.State)
-			require.WithinDuration(t, finalizedAt1, *job1Updated.FinalizedAt, time.Microsecond)
-
-			job2Updated, err := exec.JobGetByID(ctx, job2.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, job2Updated.State)
-			require.WithinDuration(t, finalizedAt2, *job2Updated.FinalizedAt, time.Microsecond)
-
-			job3Updated, err := exec.JobGetByID(ctx, job3.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, job3Updated.State)
-			require.WithinDuration(t, finalizedAt3, *job3Updated.FinalizedAt, time.Microsecond)
-			require.Equal(t, "unique-key", string(job3Updated.UniqueKey))
-
-			otherJobUpdated, err := exec.JobGetByID(ctx, otherJob.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRunning, otherJobUpdated.State)
-		})
-
-		t.Run("DoesNotCompleteJobsInNonRunningStates", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)})
-			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRetryable)})
-			job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateScheduled)})
-
-			jobsAfter, err := exec.JobSetCompleteIfRunningMany(ctx, &riverdriver.JobSetCompleteIfRunningManyParams{
-				ID:          []int64{job1.ID, job2.ID, job3.ID},
-				FinalizedAt: []time.Time{now, now, now},
-			})
-			require.NoError(t, err)
-			for _, jobAfter := range jobsAfter {
-				require.NotEqual(t, rivertype.JobStateCompleted, jobAfter.State)
-				require.Nil(t, jobAfter.FinalizedAt)
-			}
-
-			job1Updated, err := exec.JobGetByID(ctx, job1.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateAvailable, job1Updated.State)
-
-			job2Updated, err := exec.JobGetByID(ctx, job2.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, job2Updated.State)
-
-			job3Updated, err := exec.JobGetByID(ctx, job3.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateScheduled, job3Updated.State)
-		})
-
-		t.Run("MixOfRunningAndNotRunningStates", func(t *testing.T) {
-			exec, _ := setup(ctx, t)
-
-			finalizedAt1 := time.Now().UTC().Add(-1 * time.Minute)
-			finalizedAt2 := time.Now().UTC().Add(-2 * time.Minute) // ignored because job is not running
-			finalizedAt3 := time.Now().UTC().Add(-3 * time.Minute) // ignored because job is not running
-			finalizedAt4 := time.Now().UTC().Add(-3 * time.Minute)
-
-			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateAvailable)}) // not running
-			job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateScheduled)}) // not running
-			job4 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-
-			_, err := exec.JobSetCompleteIfRunningMany(ctx, &riverdriver.JobSetCompleteIfRunningManyParams{
-				ID:          []int64{job1.ID, job2.ID, job3.ID, job4.ID},
-				FinalizedAt: []time.Time{finalizedAt1, finalizedAt2, finalizedAt3, finalizedAt4},
-			})
-			require.NoError(t, err)
-
-			job1Updated, err := exec.JobGetByID(ctx, job1.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, job1Updated.State) // changed to completed
-			require.WithinDuration(t, finalizedAt1, *job1Updated.FinalizedAt, time.Microsecond)
-
-			job2Updated, err := exec.JobGetByID(ctx, job2.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateAvailable, job2Updated.State) // still available
-			require.Nil(t, job2Updated.FinalizedAt)
-
-			job3Updated, err := exec.JobGetByID(ctx, job3.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateScheduled, job3Updated.State) // still scheduled
-			require.Nil(t, job3Updated.FinalizedAt)
-
-			job4Updated, err := exec.JobGetByID(ctx, job4.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, job4Updated.State) // changed to completed
-			require.WithinDuration(t, finalizedAt4, *job4Updated.FinalizedAt, time.Microsecond)
-		})
-	})
-
-	t.Run("JobSetStateIfRunning_JobSetStateCompleted", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("CompletesARunningJob", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:     ptrutil.Ptr(rivertype.JobStateRunning),
-				UniqueKey: []byte("unique-key"),
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateCompleted(job.ID, now))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
-			require.WithinDuration(t, now, *jobAfter.FinalizedAt, time.Microsecond)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCompleted, jobUpdated.State)
-			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
-		})
-
-		t.Run("DoesNotCompleteARetryableJob", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:     ptrutil.Ptr(rivertype.JobStateRetryable),
-				UniqueKey: []byte("unique-key"),
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateCompleted(job.ID, now))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
-			require.Nil(t, jobAfter.FinalizedAt)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
-			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
 		})
 	})
 
@@ -1824,192 +1692,34 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		return errPayload
 	}
 
-	t.Run("JobSetStateIfRunning_JobSetStateErrored", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("SetsARunningJobToRetryable", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:     ptrutil.Ptr(rivertype.JobStateRunning),
-				UniqueKey: []byte("unique-key"),
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now)))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
-			require.WithinDuration(t, now, jobAfter.ScheduledAt, time.Microsecond)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
-			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
-
-			// validate error payload:
-			require.Len(t, jobAfter.Errors, 1)
-			require.Equal(t, now, jobAfter.Errors[0].At)
-			require.Equal(t, 1, jobAfter.Errors[0].Attempt)
-			require.Equal(t, "fake error", jobAfter.Errors[0].Error)
-			require.Equal(t, "foo.go:123\nbar.go:456", jobAfter.Errors[0].Trace)
-		})
-
-		t.Run("DoesNotTouchAlreadyRetryableJob", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:       ptrutil.Ptr(rivertype.JobStateRetryable),
-				ScheduledAt: ptrutil.Ptr(now.Add(10 * time.Second)),
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now)))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
-			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
-			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
-		})
-
-		t.Run("SetsAJobWithCancelAttemptedAtToCancelled", func(t *testing.T) {
-			// If a job has cancel_attempted_at in its metadata, it means that the user
-			// tried to cancel the job with the Cancel API but that the job
-			// finished/errored before the producer received the cancel notification.
-			//
-			// In this case, we want to move the job to cancelled instead of retryable
-			// so that the job is not retried.
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				Metadata:    []byte(fmt.Sprintf(`{"cancel_attempted_at":"%s"}`, time.Now().UTC().Format(time.RFC3339))),
-				State:       ptrutil.Ptr(rivertype.JobStateRunning),
-				ScheduledAt: ptrutil.Ptr(now.Add(-10 * time.Second)),
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now)))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
-			require.NotNil(t, jobAfter.FinalizedAt)
-			// Loose assertion against FinalizedAt just to make sure it was set (it uses
-			// the database's now() instead of a passed-in time):
-			require.WithinDuration(t, time.Now().UTC(), *jobAfter.FinalizedAt, 2*time.Second)
-			// ScheduledAt should not be touched:
-			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
-
-			// Errors should still be appended to:
-			require.Len(t, jobAfter.Errors, 1)
-			require.Contains(t, jobAfter.Errors[0].Error, "fake error")
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
-			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
-		})
-	})
-
-	t.Run("JobSetStateIfRunning_JobSetStateCancelled", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("CancelsARunningJob", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:        ptrutil.Ptr(rivertype.JobStateRunning),
-				UniqueKey:    []byte("unique-key"),
-				UniqueStates: 0xFF,
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateCancelled(job.ID, now, makeErrPayload(t, now)))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
-			require.WithinDuration(t, now, *jobAfter.FinalizedAt, time.Microsecond)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
-			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
-		})
-	})
-
-	t.Run("JobSetStateIfRunning_JobSetStateDiscarded", func(t *testing.T) {
-		t.Parallel()
-
-		t.Run("DiscardsARunningJob", func(t *testing.T) {
-			t.Parallel()
-
-			exec, _ := setup(ctx, t)
-
-			now := time.Now().UTC()
-
-			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
-				State:        ptrutil.Ptr(rivertype.JobStateRunning),
-				UniqueKey:    []byte("unique-key"),
-				UniqueStates: 0xFF,
-			})
-
-			jobAfter, err := exec.JobSetStateIfRunning(ctx, riverdriver.JobSetStateDiscarded(job.ID, now, makeErrPayload(t, now)))
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateDiscarded, jobAfter.State)
-			require.WithinDuration(t, now, *jobAfter.FinalizedAt, time.Microsecond)
-			require.Equal(t, "unique-key", string(jobAfter.UniqueKey))
-			require.Equal(t, rivertype.JobStates(), jobAfter.UniqueStates)
-
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
-			require.NoError(t, err)
-			require.Equal(t, rivertype.JobStateDiscarded, jobUpdated.State)
-		})
-	})
-
 	setStateManyParams := func(params ...*riverdriver.JobSetStateIfRunningParams) *riverdriver.JobSetStateIfRunningManyParams {
 		batchParams := &riverdriver.JobSetStateIfRunningManyParams{}
-		// 	ID:          make([]int64, len(params)),
-		// 	ErrData:     make([]byte, len(params)),
-		// 	FinalizedAt: make([]*time.Time, len(params)),
-		// 	MaxAttempts: []*int{maxAttempts},
-		// 	ScheduledAt: []*time.Time{scheduledAt},
-		// 	State:       []rivertype.JobState{params.State},
-		// }
 		for _, param := range params {
 			var (
+				attempt     *int
 				errData     []byte
 				finalizedAt *time.Time
-				maxAttempts *int
 				scheduledAt *time.Time
 			)
+			if param.Attempt != nil {
+				attempt = param.Attempt
+			}
 			if param.ErrData != nil {
 				errData = param.ErrData
 			}
 			if param.FinalizedAt != nil {
 				finalizedAt = param.FinalizedAt
 			}
-			if param.MaxAttempts != nil {
-				maxAttempts = param.MaxAttempts
-			}
 			if param.ScheduledAt != nil {
 				scheduledAt = param.ScheduledAt
 			}
 
 			batchParams.ID = append(batchParams.ID, param.ID)
+			batchParams.Attempt = append(batchParams.Attempt, attempt)
 			batchParams.ErrData = append(batchParams.ErrData, errData)
 			batchParams.FinalizedAt = append(batchParams.FinalizedAt, finalizedAt)
-			batchParams.MaxAttempts = append(batchParams.MaxAttempts, maxAttempts)
+			batchParams.MetadataDoMerge = append(batchParams.MetadataDoMerge, param.MetadataDoMerge)
+			batchParams.MetadataUpdates = append(batchParams.MetadataUpdates, param.MetadataUpdates)
 			batchParams.ScheduledAt = append(batchParams.ScheduledAt, scheduledAt)
 			batchParams.State = append(batchParams.State, param.State)
 		}
@@ -2032,13 +1742,13 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueKey: []byte("unique-key"),
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now)))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
 			require.WithinDuration(t, now, *jobAfter.FinalizedAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateCompleted, jobUpdated.State)
 			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
@@ -2056,16 +1766,36 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueKey: []byte("unique-key"),
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now)))
-			jobAfter := jobsAfter[0]
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, nil)))
 			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
 			require.Nil(t, jobAfter.FinalizedAt)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
 			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+
+		t.Run("StoresMetadataUpdates", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata:  []byte(`{"foo":"baz", "something":"else"}`),
+				State:     ptrutil.Ptr(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, []byte(`{"a":"b", "foo":"bar"}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
+			require.JSONEq(t, `{"a":"b", "foo":"bar", "something":"else"}`, string(jobAfter.Metadata))
 		})
 	})
 
@@ -2084,13 +1814,13 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueKey: []byte("unique-key"),
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now))))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
 			require.WithinDuration(t, now, jobAfter.ScheduledAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
 			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
@@ -2103,7 +1833,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.Equal(t, "foo.go:123\nbar.go:456", jobAfter.Errors[0].Trace)
 		})
 
-		t.Run("DoesNotTouchAlreadyRetryableJob", func(t *testing.T) {
+		t.Run("DoesNotTouchAlreadyRetryableJobWithNoMetadataUpdates", func(t *testing.T) {
 			t.Parallel()
 
 			exec, _ := setup(ctx, t)
@@ -2115,16 +1845,47 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				ScheduledAt: ptrutil.Ptr(now.Add(10 * time.Second)),
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now))))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
 			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
 			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+		})
+
+		t.Run("UpdatesOnlyMetadataForAlreadyRetryableJobs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata:    []byte(`{"baz":"qux", "foo":"bar"}`),
+				State:       ptrutil.Ptr(rivertype.JobStateRetryable),
+				ScheduledAt: ptrutil.Ptr(now.Add(10 * time.Second)),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+				riverdriver.JobSetStateErrorRetryable(job1.ID, now, makeErrPayload(t, now), []byte(`{"foo":"1", "output":{"a":"b"}}`)),
+			))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			require.JSONEq(t, `{"baz":"qux", "foo":"1", "output":{"a":"b"}}`, string(jobAfter.Metadata))
+			require.Empty(t, jobAfter.Errors)
+			require.Equal(t, job1.ScheduledAt, jobAfter.ScheduledAt)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
+			require.JSONEq(t, `{"baz":"qux", "foo":"1", "output":{"a":"b"}}`, string(jobUpdated.Metadata))
+			require.Empty(t, jobUpdated.Errors)
+			require.Equal(t, job1.ScheduledAt, jobUpdated.ScheduledAt)
 		})
 
 		t.Run("SetsAJobWithCancelAttemptedAtToCancelled", func(t *testing.T) {
@@ -2146,7 +1907,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				ScheduledAt: ptrutil.Ptr(now.Add(-10 * time.Second)),
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now))))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
@@ -2161,7 +1922,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.Len(t, jobAfter.Errors, 1)
 			require.Contains(t, jobAfter.Errors[0].Error, "fake error")
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
 			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
@@ -2184,13 +1945,13 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueStates: 0xFF,
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCancelled(job.ID, now, makeErrPayload(t, now))))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCancelled(job.ID, now, makeErrPayload(t, now), nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
 			require.WithinDuration(t, now, *jobAfter.FinalizedAt, time.Microsecond)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
 			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
@@ -2213,7 +1974,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				UniqueStates: 0xFF,
 			})
 
-			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateDiscarded(job.ID, now, makeErrPayload(t, now))))
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateDiscarded(job.ID, now, makeErrPayload(t, now), nil)))
 			require.NoError(t, err)
 			jobAfter := jobsAfter[0]
 			require.Equal(t, rivertype.JobStateDiscarded, jobAfter.State)
@@ -2221,9 +1982,78 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.Equal(t, "unique-key", string(jobAfter.UniqueKey))
 			require.Equal(t, rivertype.JobStates(), jobAfter.UniqueStates)
 
-			jobUpdated, err := exec.JobGetByID(ctx, job.ID)
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
 			require.NoError(t, err)
 			require.Equal(t, rivertype.JobStateDiscarded, jobUpdated.State)
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateSnoozed", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("SnoozesARunningJob_WithNoPreexistingMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+			snoozeUntil := now.Add(1 * time.Minute)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:   ptrutil.Ptr(5),
+				State:     ptrutil.Ptr(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateSnoozed(job.ID, snoozeUntil, 4, []byte(`{"snoozes": 1}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, 4, jobAfter.Attempt)
+			require.Equal(t, job.MaxAttempts, jobAfter.MaxAttempts)
+			require.JSONEq(t, `{"snoozes": 1}`, string(jobAfter.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobAfter.State)
+			require.WithinDuration(t, snoozeUntil, jobAfter.ScheduledAt, time.Microsecond)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, 4, jobUpdated.Attempt)
+			require.Equal(t, job.MaxAttempts, jobUpdated.MaxAttempts)
+			require.JSONEq(t, `{"snoozes": 1}`, string(jobUpdated.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+
+		t.Run("SnoozesARunningJob_WithPreexistingMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+			snoozeUntil := now.Add(1 * time.Minute)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:   ptrutil.Ptr(5),
+				State:     ptrutil.Ptr(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+				Metadata:  []byte(`{"foo": "bar", "snoozes": 5}`),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateSnoozed(job.ID, snoozeUntil, 4, []byte(`{"snoozes": 6}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, 4, jobAfter.Attempt)
+			require.Equal(t, job.MaxAttempts, jobAfter.MaxAttempts)
+			require.JSONEq(t, `{"foo": "bar", "snoozes": 6}`, string(jobAfter.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobAfter.State)
+			require.WithinDuration(t, snoozeUntil, jobAfter.ScheduledAt, time.Microsecond)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, 4, jobUpdated.Attempt)
+			require.Equal(t, job.MaxAttempts, jobUpdated.MaxAttempts)
+			require.JSONEq(t, `{"foo": "bar", "snoozes": 6}`, string(jobUpdated.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
 		})
 	})
 
@@ -2240,14 +2070,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
 
 		jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
-			riverdriver.JobSetStateCompleted(job1.ID, now),
-			riverdriver.JobSetStateErrorRetryable(job2.ID, future, makeErrPayload(t, now)),
-			riverdriver.JobSetStateCancelled(job3.ID, now, makeErrPayload(t, now)),
+			riverdriver.JobSetStateCompleted(job1.ID, now, []byte(`{"a":"b"}`)),
+			riverdriver.JobSetStateErrorRetryable(job2.ID, future, makeErrPayload(t, now), nil),
+			riverdriver.JobSetStateCancelled(job3.ID, now, makeErrPayload(t, now), nil),
 		))
 		require.NoError(t, err)
 		completedJob := jobsAfter[0]
 		require.Equal(t, rivertype.JobStateCompleted, completedJob.State)
 		require.WithinDuration(t, now, *completedJob.FinalizedAt, time.Microsecond)
+		require.JSONEq(t, `{"a":"b"}`, string(completedJob.Metadata))
 
 		retryableJob := jobsAfter[1]
 		require.Equal(t, rivertype.JobStateRetryable, retryableJob.State)
@@ -2279,6 +2110,8 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			Attempt:             7,
 			AttemptedAtDoUpdate: true,
 			AttemptedAt:         &now,
+			AttemptedByDoUpdate: true,
+			AttemptedBy:         []string{"worker1"},
 			ErrorsDoUpdate:      true,
 			Errors:              [][]byte{[]byte(`{"error":"message"}`)},
 			FinalizedAtDoUpdate: true,
@@ -2289,6 +2122,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.Equal(t, 7, updatedJob.Attempt)
 		requireEqualTime(t, now, *updatedJob.AttemptedAt)
+		require.Equal(t, []string{"worker1"}, updatedJob.AttemptedBy)
 		require.Equal(t, "message", updatedJob.Errors[0].Error)
 		requireEqualTime(t, now, *updatedJob.FinalizedAt)
 		require.Equal(t, rivertype.JobStateDiscarded, updatedJob.State)
@@ -2304,7 +2138,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		now := time.Now().UTC()
 
 		{
-			numDeleted, err := exec.LeaderDeleteExpired(ctx)
+			numDeleted, err := exec.LeaderDeleteExpired(ctx, &riverdriver.LeaderDeleteExpiredParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Zero(t, numDeleted)
 		}
@@ -2316,7 +2152,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		})
 
 		{
-			numDeleted, err := exec.LeaderDeleteExpired(ctx)
+			numDeleted, err := exec.LeaderDeleteExpired(ctx, &riverdriver.LeaderDeleteExpiredParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Equal(t, 1, numDeleted)
 		}
@@ -2337,7 +2175,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.True(t, elected) // won election
 
-			leader, err := exec.LeaderGetElectedLeader(ctx)
+			leader, err := exec.LeaderGetElectedLeader(ctx, &riverdriver.LeaderGetElectedLeaderParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.WithinDuration(t, time.Now(), leader.ElectedAt, 100*time.Millisecond)
 			require.WithinDuration(t, time.Now().Add(leaderTTL), leader.ExpiresAt, 100*time.Millisecond)
@@ -2362,7 +2202,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			// The time should not have changed because we specified that we were not
 			// already elected, and the elect query is a no-op if there's already a
 			// updatedLeader:
-			updatedLeader, err := exec.LeaderGetElectedLeader(ctx)
+			updatedLeader, err := exec.LeaderGetElectedLeader(ctx, &riverdriver.LeaderGetElectedLeaderParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Equal(t, leader.ExpiresAt, updatedLeader.ExpiresAt)
 		})
@@ -2383,7 +2225,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.NoError(t, err)
 			require.True(t, elected) // won election
 
-			leader, err := exec.LeaderGetElectedLeader(ctx)
+			leader, err := exec.LeaderGetElectedLeader(ctx, &riverdriver.LeaderGetElectedLeaderParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.WithinDuration(t, time.Now(), leader.ElectedAt, 100*time.Millisecond)
 			require.WithinDuration(t, time.Now().Add(leaderTTL), leader.ExpiresAt, 100*time.Millisecond)
@@ -2410,7 +2254,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			// expires_at should be incremented because this is the same leader that won
 			// previously and we specified that we're already elected:
-			updatedLeader, err := exec.LeaderGetElectedLeader(ctx)
+			updatedLeader, err := exec.LeaderGetElectedLeader(ctx, &riverdriver.LeaderGetElectedLeaderParams{
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Greater(t, updatedLeader.ExpiresAt, leader.ExpiresAt)
 		})
@@ -2440,7 +2286,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			LeaderID: ptrutil.Ptr(clientID),
 		})
 
-		leader, err := exec.LeaderGetElectedLeader(ctx)
+		leader, err := exec.LeaderGetElectedLeader(ctx, &riverdriver.LeaderGetElectedLeaderParams{
+			Schema: "",
+		})
 		require.NoError(t, err)
 		require.WithinDuration(t, time.Now(), leader.ElectedAt, 500*time.Millisecond)
 		require.WithinDuration(t, time.Now().Add(leaderTTL), leader.ExpiresAt, 500*time.Millisecond)
@@ -2522,9 +2370,12 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		_, err := exec.Exec(ctx, "ALTER TABLE river_migration DROP COLUMN line")
 		require.NoError(t, err)
 
-		migrations, err := exec.MigrationDeleteAssumingMainMany(ctx, []int{
-			migration1.Version,
-			migration2.Version,
+		migrations, err := exec.MigrationDeleteAssumingMainMany(ctx, &riverdriver.MigrationDeleteAssumingMainManyParams{
+			Schema: "",
+			Versions: []int{
+				migration1.Version,
+				migration2.Version,
+			},
 		})
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
@@ -2548,9 +2399,13 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		migration1 := testfactory.Migration(ctx, t, exec, &testfactory.MigrationOpts{Line: ptrutil.Ptr("alternate")})
 		migration2 := testfactory.Migration(ctx, t, exec, &testfactory.MigrationOpts{Line: ptrutil.Ptr("alternate")})
 
-		migrations, err := exec.MigrationDeleteByLineAndVersionMany(ctx, "alternate", []int{
-			migration1.Version,
-			migration2.Version,
+		migrations, err := exec.MigrationDeleteByLineAndVersionMany(ctx, &riverdriver.MigrationDeleteByLineAndVersionManyParams{
+			Line:   "alternate",
+			Schema: "",
+			Versions: []int{
+				migration1.Version,
+				migration2.Version,
+			},
 		})
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
@@ -2578,7 +2433,9 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		_, err := exec.Exec(ctx, "ALTER TABLE river_migration DROP COLUMN line")
 		require.NoError(t, err)
 
-		migrations, err := exec.MigrationGetAllAssumingMain(ctx)
+		migrations, err := exec.MigrationGetAllAssumingMain(ctx, &riverdriver.MigrationGetAllAssumingMainParams{
+			Schema: "",
+		})
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
 		require.Equal(t, migration1.Version, migrations[0].Version)
@@ -2604,7 +2461,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		migration1 := testfactory.Migration(ctx, t, exec, &testfactory.MigrationOpts{Line: ptrutil.Ptr("alternate")})
 		migration2 := testfactory.Migration(ctx, t, exec, &testfactory.MigrationOpts{Line: ptrutil.Ptr("alternate")})
 
-		migrations, err := exec.MigrationGetByLine(ctx, "alternate")
+		migrations, err := exec.MigrationGetByLine(ctx, &riverdriver.MigrationGetByLineParams{
+			Line:   "alternate",
+			Schema: "",
+		})
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
 		require.Equal(t, migration1.Version, migrations[0].Version)
@@ -2624,7 +2484,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 		truncateMigrations(ctx, t, exec)
 
-		migrations, err := exec.MigrationInsertMany(ctx, "alternate", []int{1, 2})
+		migrations, err := exec.MigrationInsertMany(ctx, &riverdriver.MigrationInsertManyParams{
+			Line:     "alternate",
+			Versions: []int{1, 2},
+		})
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
 		require.Equal(t, "alternate", migrations[0].Line)
@@ -2647,7 +2510,11 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		_, err := exec.Exec(ctx, "ALTER TABLE river_migration DROP COLUMN line")
 		require.NoError(t, err)
 
-		migrations, err := exec.MigrationInsertManyAssumingMain(ctx, []int{1, 2})
+		migrations, err := exec.MigrationInsertManyAssumingMain(ctx, &riverdriver.MigrationInsertManyAssumingMainParams{
+			Schema:   "",
+			Versions: []int{1, 2},
+		})
+
 		require.NoError(t, err)
 		require.Len(t, migrations, 2)
 		require.Equal(t, riverdriver.MigrationLineMain, migrations[0].Line)
@@ -2661,11 +2528,17 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 		exec, _ := setup(ctx, t)
 
-		exists, err := exec.TableExists(ctx, "river_job")
+		exists, err := exec.TableExists(ctx, &riverdriver.TableExistsParams{
+			Schema: "",
+			Table:  "river_job",
+		})
 		require.NoError(t, err)
 		require.True(t, exists)
 
-		exists, err = exec.TableExists(ctx, "does_not_exist")
+		exists, err = exec.TableExists(ctx, &riverdriver.TableExistsParams{
+			Schema: "",
+			Table:  "does_not_exist",
+		})
 		require.NoError(t, err)
 		require.False(t, exists)
 
@@ -2676,7 +2549,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 		_, err = exec.Exec(ctx, "SET search_path = another_schema_123")
 		require.NoError(t, err)
 
-		exists, err = exec.TableExists(ctx, "river_job")
+		exists, err = exec.TableExists(ctx, &riverdriver.TableExistsParams{
+			Schema: "",
+			Table:  "river_job",
+		})
 		require.NoError(t, err)
 		require.False(t, exists)
 	})
@@ -2824,7 +2700,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 			queue := testfactory.Queue(ctx, t, exec, &testfactory.QueueOpts{Metadata: []byte(`{"foo": "bar"}`)})
 
-			queueFetched, err := exec.QueueGet(ctx, queue.Name)
+			queueFetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+				Name:   queue.Name,
+				Schema: "",
+			})
 			require.NoError(t, err)
 
 			require.WithinDuration(t, queue.CreatedAt, queueFetched.CreatedAt, time.Millisecond)
@@ -2833,7 +2712,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			require.Nil(t, queueFetched.PausedAt)
 			require.WithinDuration(t, queue.UpdatedAt, queueFetched.UpdatedAt, time.Millisecond)
 
-			queueFetched, err = exec.QueueGet(ctx, "nonexistent-queue")
+			queueFetched, err = exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+				Name:   "nonexistent-queue",
+				Schema: "",
+			})
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 			require.Nil(t, queueFetched)
 		})
@@ -2856,7 +2738,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				}
 			}
 
-			queues, err := exec.QueueList(ctx, 10)
+			queues, err := exec.QueueList(ctx, &riverdriver.QueueListParams{
+				Limit:  10,
+				Schema: "",
+			})
 			require.NoError(t, err)
 			require.Empty(t, queues)
 
@@ -2867,14 +2752,20 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 			queue2 := testfactory.Queue(ctx, t, exec, nil)
 			queue3 := testfactory.Queue(ctx, t, exec, nil)
 
-			queues, err = exec.QueueList(ctx, 2)
+			queues, err = exec.QueueList(ctx, &riverdriver.QueueListParams{
+				Limit:  2,
+				Schema: "",
+			})
 			require.NoError(t, err)
 
 			require.Len(t, queues, 2)
 			requireQueuesEqual(t, queue1, queues[0])
 			requireQueuesEqual(t, queue2, queues[1])
 
-			queues, err = exec.QueueList(ctx, 3)
+			queues, err = exec.QueueList(ctx, &riverdriver.QueueListParams{
+				Limit:  3,
+				Schema: "",
+			})
 			require.NoError(t, err)
 
 			require.Len(t, queues, 3)
@@ -2893,9 +2784,14 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					PausedAt: ptrutil.Ptr(time.Now()),
 				})
 
-				require.NoError(t, exec.QueuePause(ctx, queue.Name))
-
-				queueFetched, err := exec.QueueGet(ctx, queue.Name)
+				require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   queue.Name,
+					Schema: "",
+				}))
+				queueFetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.NotNil(t, queueFetched.PausedAt)
 				requireEqualTime(t, *queue.PausedAt, *queueFetched.PausedAt) // paused_at stays unchanged
@@ -2910,9 +2806,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				queue := testfactory.Queue(ctx, t, exec, nil)
 				require.Nil(t, queue.PausedAt)
 
-				require.NoError(t, exec.QueuePause(ctx, queue.Name))
+				require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   queue.Name,
+					Schema: "",
+				}))
 
-				queueFetched, err := exec.QueueGet(ctx, queue.Name)
+				queueFetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.NotNil(t, queueFetched.PausedAt)
 				require.WithinDuration(t, time.Now(), *(queueFetched.PausedAt), 500*time.Millisecond)
@@ -2923,7 +2825,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 				exec, _ := setup(ctx, t)
 
-				err := exec.QueuePause(ctx, "queue1")
+				err := exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   "queue1",
+					Schema: "",
+				})
 				require.ErrorIs(t, err, rivertype.ErrNotFound)
 			})
 
@@ -2937,16 +2842,25 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				queue2 := testfactory.Queue(ctx, t, exec, nil)
 				require.Nil(t, queue2.PausedAt)
 
-				require.NoError(t, exec.QueuePause(ctx, rivercommon.AllQueuesString))
+				require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   rivercommon.AllQueuesString,
+					Schema: "",
+				}))
 
 				now := time.Now()
 
-				queue1Fetched, err := exec.QueueGet(ctx, queue1.Name)
+				queue1Fetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue1.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.NotNil(t, queue1Fetched.PausedAt)
 				require.WithinDuration(t, now, *(queue1Fetched.PausedAt), 500*time.Millisecond)
 
-				queue2Fetched, err := exec.QueueGet(ctx, queue2.Name)
+				queue2Fetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue2.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.NotNil(t, queue2Fetched.PausedAt)
 				require.WithinDuration(t, now, *(queue2Fetched.PausedAt), 500*time.Millisecond)
@@ -2957,7 +2871,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 				exec, _ := setup(ctx, t)
 
-				require.NoError(t, exec.QueuePause(ctx, rivercommon.AllQueuesString))
+				require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   rivercommon.AllQueuesString,
+					Schema: "",
+				}))
 			})
 		})
 
@@ -2973,9 +2890,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 					PausedAt: ptrutil.Ptr(time.Now()),
 				})
 
-				require.NoError(t, exec.QueueResume(ctx, queue.Name))
+				require.NoError(t, exec.QueueResume(ctx, &riverdriver.QueueResumeParams{
+					Name:   queue.Name,
+					Schema: "",
+				}))
 
-				queueFetched, err := exec.QueueGet(ctx, queue.Name)
+				queueFetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.Nil(t, queueFetched.PausedAt)
 			})
@@ -2987,9 +2910,15 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 				queue := testfactory.Queue(ctx, t, exec, nil)
 
-				require.NoError(t, exec.QueueResume(ctx, queue.Name))
+				require.NoError(t, exec.QueueResume(ctx, &riverdriver.QueueResumeParams{
+					Name:   queue.Name,
+					Schema: "",
+				}))
 
-				queueFetched, err := exec.QueueGet(ctx, queue.Name)
+				queueFetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.Nil(t, queueFetched.PausedAt)
 				requireEqualTime(t, queue.UpdatedAt, queueFetched.UpdatedAt) // updated_at stays unchanged
@@ -3000,7 +2929,10 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 				exec, _ := setup(ctx, t)
 
-				err := exec.QueueResume(ctx, "queue1")
+				err := exec.QueueResume(ctx, &riverdriver.QueueResumeParams{
+					Name:   "queue1",
+					Schema: "",
+				})
 				require.ErrorIs(t, err, rivertype.ErrNotFound)
 			})
 
@@ -3014,14 +2946,26 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 				queue2 := testfactory.Queue(ctx, t, exec, nil)
 				require.Nil(t, queue2.PausedAt)
 
-				require.NoError(t, exec.QueuePause(ctx, rivercommon.AllQueuesString))
-				require.NoError(t, exec.QueueResume(ctx, rivercommon.AllQueuesString))
+				require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{
+					Name:   rivercommon.AllQueuesString,
+					Schema: "",
+				}))
+				require.NoError(t, exec.QueueResume(ctx, &riverdriver.QueueResumeParams{
+					Name:   rivercommon.AllQueuesString,
+					Schema: "",
+				}))
 
-				queue1Fetched, err := exec.QueueGet(ctx, queue1.Name)
+				queue1Fetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue1.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.Nil(t, queue1Fetched.PausedAt)
 
-				queue2Fetched, err := exec.QueueGet(ctx, queue2.Name)
+				queue2Fetched, err := exec.QueueGet(ctx, &riverdriver.QueueGetParams{
+					Name:   queue2.Name,
+					Schema: "",
+				})
 				require.NoError(t, err)
 				require.Nil(t, queue2Fetched.PausedAt)
 			})
@@ -3031,7 +2975,46 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 
 				exec, _ := setup(ctx, t)
 
-				require.NoError(t, exec.QueueResume(ctx, rivercommon.AllQueuesString))
+				require.NoError(t, exec.QueueResume(ctx, &riverdriver.QueueResumeParams{
+					Name:   rivercommon.AllQueuesString,
+					Schema: "",
+				}))
+			})
+		})
+
+		t.Run("QueueUpdate", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("UpdatesFieldsIfDoUpdateIsTrue", func(t *testing.T) {
+				t.Parallel()
+
+				exec, _ := setup(ctx, t)
+
+				queue := testfactory.Queue(ctx, t, exec, &testfactory.QueueOpts{Metadata: []byte(`{"foo": "bar"}`)})
+
+				updatedQueue, err := exec.QueueUpdate(ctx, &riverdriver.QueueUpdateParams{
+					Metadata:         []byte(`{"baz": "qux"}`),
+					MetadataDoUpdate: true,
+					Name:             queue.Name,
+				})
+				require.NoError(t, err)
+				require.JSONEq(t, `{"baz": "qux"}`, string(updatedQueue.Metadata))
+			})
+
+			t.Run("DoesNotUpdateFieldsIfDoUpdateIsFalse", func(t *testing.T) {
+				t.Parallel()
+
+				exec, _ := setup(ctx, t)
+
+				queue := testfactory.Queue(ctx, t, exec, &testfactory.QueueOpts{Metadata: []byte(`{"foo": "bar"}`)})
+
+				updatedQueue, err := exec.QueueUpdate(ctx, &riverdriver.QueueUpdateParams{
+					Metadata:         []byte(`{"baz": "qux"}`),
+					MetadataDoUpdate: false,
+					Name:             queue.Name,
+				})
+				require.NoError(t, err)
+				require.JSONEq(t, `{"foo": "bar"}`, string(updatedQueue.Metadata))
 			})
 		})
 	})
@@ -3045,9 +3028,10 @@ type testListenerBundle[TTx any] struct {
 func setupListener[TTx any](ctx context.Context, t *testing.T, getDriverWithPool func(ctx context.Context, t *testing.T) riverdriver.Driver[TTx]) (riverdriver.Listener, *testListenerBundle[TTx]) {
 	t.Helper()
 
-	driver := getDriverWithPool(ctx, t)
-
-	listener := driver.GetListener()
+	var (
+		driver   = getDriverWithPool(ctx, t)
+		listener = driver.GetListener("")
+	)
 
 	return listener, &testListenerBundle[TTx]{
 		driver: driver,
@@ -3108,8 +3092,8 @@ func exerciseListener[TTx any](ctx context.Context, t *testing.T, driverWithPool
 		require.NoError(t, listener.Ping(ctx)) // still alive
 
 		{
-			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1_1"}}))
-			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic2", Payload: []string{"payload2_1"}}))
+			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1_1"}, Schema: ""}))
+			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic2", Payload: []string{"payload2_1"}, Schema: ""}))
 
 			notification := waitForNotification(ctx, t, listener)
 			require.Equal(t, &riverdriver.Notification{Topic: "topic1", Payload: "payload1_1"}, notification)
@@ -3120,8 +3104,8 @@ func exerciseListener[TTx any](ctx context.Context, t *testing.T, driverWithPool
 		require.NoError(t, listener.Unlisten(ctx, "topic2"))
 
 		{
-			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1_2"}}))
-			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic2", Payload: []string{"payload2_2"}}))
+			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1_2"}, Schema: ""}))
+			require.NoError(t, bundle.exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic2", Payload: []string{"payload2_2"}, Schema: ""}))
 
 			notification := waitForNotification(ctx, t, listener)
 			require.Equal(t, &riverdriver.Notification{Topic: "topic1", Payload: "payload1_2"}, notification)
@@ -3132,6 +3116,25 @@ func exerciseListener[TTx any](ctx context.Context, t *testing.T, driverWithPool
 		require.NoError(t, listener.Unlisten(ctx, "topic1"))
 
 		require.NoError(t, listener.Close(ctx))
+	})
+
+	t.Run("SchemaFromParameter", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			driver   = driverWithPool(ctx, t)
+			listener = driver.GetListener("my_custom_schema")
+		)
+
+		require.Equal(t, "my_custom_schema", listener.Schema())
+	})
+
+	t.Run("SchemaFromSearchPath", func(t *testing.T) {
+		t.Parallel()
+
+		listener, _ := setupListener(ctx, t, driverWithPool)
+		connectListener(ctx, t, listener)
+		require.Equal(t, "public", listener.Schema())
 	})
 
 	t.Run("TransactionGated", func(t *testing.T) {
@@ -3146,7 +3149,7 @@ func exerciseListener[TTx any](ctx context.Context, t *testing.T, driverWithPool
 		tx, err := bundle.exec.Begin(ctx)
 		require.NoError(t, err)
 
-		require.NoError(t, tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1"}}))
+		require.NoError(t, tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{Topic: "topic1", Payload: []string{"payload1"}, Schema: ""}))
 
 		// No notification because the transaction hasn't committed yet.
 		requireNoNotification(ctx, t, listener)
@@ -3191,4 +3194,13 @@ func requireEqualTime(t *testing.T, expected, actual time.Time) {
 		expected.Format(rfc3339Micro),
 		actual.Format(rfc3339Micro),
 	)
+}
+
+func requireMissingRelation(t *testing.T, err error, missingRelation string) {
+	t.Helper()
+
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, pgerrcode.UndefinedTable, pgErr.Code)
+	require.Equal(t, fmt.Sprintf(`relation "%s" does not exist`, missingRelation), pgErr.Message)
 }

@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `river/riverlog` containing middleware that injects a context logger to workers that collates log output and persists it with job metadata. This is paired with a River UI enhancement that shows logs in the UI. [PR #844](https://github.com/riverqueue/river/pull/844).
+- Added `JobInsertMiddlewareFunc` and `WorkerMiddlewareFunc` to easily implement middleware with a function instead of a struct. [PR #844](https://github.com/riverqueue/river/pull/844).
+
+### Changed
+
+- Client no longer returns an error if stopped before startup could complete (previously, it returned the unexported `ErrShutdown`). [PR #841](https://github.com/riverqueue/river/pull/841).
+
+## [0.20.2] - 2025-04-08
+
+### Added
+
+- Added `QueueUpdateTx` API so there's a transactional variant of the `QueueUpdate` API from [PR #834](https://github.com/riverqueue/river/pull/834). [PR #838](https://github.com/riverqueue/river/pull/838).
+
+## [0.20.1] - 2025-04-05
+
+### Fixed
+
+- Corrected the serialization of queue control event payloads emitted by `QueueUpdate`. [PR #834](https://github.com/riverqueue/river/pull/834).
+
+## [0.20.0] - 2025-04-04
+
+### Added
+
+- Added a `QueueUpdate` API to the `Client` which will be used for upcoming functionality. [PR #822](https://github.com/riverqueue/river/pull/822).
+
+### Changed
+
+- Set minimum Go version to Go 1.23. [PR #811](https://github.com/riverqueue/river/pull/811).
+- Deprecate `river.JobInsertMiddlewareDefaults` and `river.WorkerMiddlewareDefaults` in favor of the more general `river.MiddlewareDefaults` embeddable struct. The two former structs will be removed in a future version. [PR #815](https://github.com/riverqueue/river/pull/815).
+
+### Fixed
+
+- Cleanly error when attempting to add a queue at runtime to a `Client` which was not configured to run jobs (no `Workers`). [PR #826](https://github.com/riverqueue/river/pull/826).
+
+## [0.19.0] - 2025-03-16
+
+⚠️ Version 0.19.0 has minor breaking changes for the `Worker.Middleware`, introduced fairly recently in 0.17.0 that has a worker's `Middleware` function now taking a non-generic `JobRow` parameter instead of a generic `Job[T]`. We tried not to make this change, but found the existing middleware interface insufficient to provide the necessary range of functionality we wanted, and this is a secondary middleware facility that won't be in use for many users, so it seemed worthwhile.
+
+### Added
+
+- Added a new "hooks" API for tying into River functionality at various points like job inserts or working. Differs from middleware in that it doesn't go on the stack and can't modify context, but in some cases is able to run at a more granular level (e.g. for each job insert rather than each _batch_ of inserts). [PR #789](https://github.com/riverqueue/river/pull/789).
+- `river.Config` has a generic `Middleware` setting that can be used as a convenient way to configure middlewares that implement multiple middleware interfaces (e.g. `JobInsertMiddleware` _and_ `WorkerMiddleware`). Use of this setting is preferred over `Config.JobInsertMiddleware` and `Config.WorkerMiddleware`, which have been deprecated. [PR #804](https://github.com/riverqueue/river/pull/804).
+
+### Changed
+
+- The `river.RecordOutput` function now returns an error if the output is too large. The output is limited to 32MB in size. [PR #782](https://github.com/riverqueue/river/pull/782).
+- **Breaking change:** The `Worker` interface's `Middleware` function now takes a `JobRow` parameter instead of a generic `Job[T]`. This was necessary to expand the potential of what middleware can do: by letting the executor extract a middleware stack from a worker before a job is fully unmarshaled, the middleware can also participate in the unmarshaling process. [PR #783](https://github.com/riverqueue/river/pull/783).
+- `JobList` has been reimplemented to use sqlc. [PR #795](https://github.com/riverqueue/river/pull/795).
+
+## [0.18.0] - 2025-02-20
+
+⚠️ Version 0.18.0 has breaking changes for the `rivertest.Worker` type that was just introduced. While attempting to round out some edge cases with its design, we realized some of them simply couldn't be solved adequately without changing the overall design such that all tested jobs are inserted into the database. Given the short duration since it was released (over a weekend) it's unlikely many users have adopted it and it seemed best to rip off the bandaid to fix it before it gets widely used.
+
+### Added
+
+- Jobs can now store a recorded "output" value, a JSON-encoded payload set by the job during execution and stored in the job's metadata. The `river.RecordOutput` function makes it easy to use the job row to store transient/temporary values that are needed for introspection or for other downstream jobs. The output can be accessed using the `JobRow.Output()` helper method.
+
+  This output is stored at the same time as the job is completed following execution, so it does not require additional database calls or overhead. Output can be anything that can be stored in a Postgres JSONB field, though for performance reasons it should be limited in size. [PR #758](https://github.com/riverqueue/river/pull/758).
+
+### Changed
+
+- **Breaking change:** The `rivertest.Worker` type now requires all jobs to be inserted into the database. The original design allowed workers to be tested without hitting the database at all. Ultimately this design made it hard to correctly simulate features like `JobCompleteTx` and the other potential solutions seemed undesirable.
+
+  As part of this change, the `Work` and `WorkJob` methods now take a transaction argument. The expectation is that a transaction will be opened by the caller and rolled back after test completion. Additionally, the return signature was changed to return a `WorkResult` struct alongside the error. The struct includes the post-execution job row as well as the event kind that occurred, making it easy to inspect the job's state after execution.
+
+  Finally, the implementation was refactored so that it uses the _real_ `river.Client` insert path, and also uses the same job execution path as real execution. This minimizes the potential for differences in behavior between testing and real execution.
+  [PR #766](https://github.com/riverqueue/river/pull/766).
+
+- Adjusted panic stack traces to filter out irrelevant frames like the ones generated by the runtime package that constructed the trace, or River's internal rescuing code. This makes the first panic frame reflect the actual panic origin for easier debugging. [PR #774](https://github.com/riverqueue/river/pull/774).
+
+### Fixed
+
+- Fix error message on unsuccessful client subscribe that erroneously referred to "Workers" not configured. [PR #771](https://github.com/riverqueue/river/pull/771).
+- Fix an issue with encoding unique keys in riverdatabasesql driver. [PR #777](https://github.com/riverqueue/river/pull/777).
+
+## [0.17.0] - 2025-02-16
+
+### Added
+
+- Exposed `TestConfig` struct on `Config` under the `Test` field for configuration that is specific to test environments. For now, the only field on this type is `Time`, which can be used to set a synthetic `TimeGenerator` for tests. A stubbable time generator was added as `rivertest.TimeStub` to allow time to be easily stubbed in tests. [PR #754](https://github.com/riverqueue/river/pull/754).
+- New `rivertest.Worker` type to make it significantly easier to test River workers. Either real or synthetic jobs can be worked using this interface, generally without requiring any database interactions. The `Worker` type provides a realistic execution environment with access to the full range of River features, including `river.ClientFromContext`, middleware (both global and per-worker), and timeouts. [PR #753](https://github.com/riverqueue/river/pull/753).
+
+### Changed
+
+- Errors returned from retryable jobs are now logged with warning logs instead of error logs. Error logs are still used for jobs that error after reaching `max_attempts`. [PR #743](https://github.com/riverqueue/river/pull/743).
+- Remove range variable capture in `for` loops and use simplified `range` syntax. Each of these requires Go 1.22 or later, which was already our minimum required version since Go 1.23 was released. [PR #755](https://github.com/riverqueue/river/pull/755).
+
+### Fixed
+
+- `riverdatabasesql` driver: properly handle `nil` values in `bytea[]` inputs. This fixes the driver's handling of empty unique keys on insert for non-unique jobs with the newer unique jobs implementation. [PR #739](https://github.com/riverqueue/river/pull/739).
+- `JobCompleteTx` now returns `rivertype.ErrNotFound` if the job doesn't exist instead of panicking. [PR #753](https://github.com/riverqueue/river/pull/753).
+- - `NeverSchedule.Next` now returns the correct maximum time value, ensuring that the periodic job truly never runs. This fixes an issue where an incorrect maximum timestamp was previously used. Thanks Hubert Krauze ([@krhubert](https://github.com/krhubert))! [PR #760](https://github.com/riverqueue/river/pull/760)
+
+## [0.16.0] - 2024-01-27
+
+### Added
+
+- `NeverSchedule` returns a `PeriodicSchedule` that never runs. This can be used to effectively disable the reindexer or any other maintenance service. [PR #718](https://github.com/riverqueue/river/pull/718).
+- Add `SkipUnknownJobCheck` client config option to skip job arg worker validation. [PR #731](https://github.com/riverqueue/river/pull/731).
+
+### Changed
+
+- The reindexer maintenance process has been enabled. As of now, it will reindex only the `river_job_args_index` and `river_jobs_metadata_index` `GIN` indexes, which are more prone to bloat than b-tree indexes. By default it runs daily at midnight UTC, but can be customized on the `river.Config` type via `ReindexerSchedule`. Most installations will benefit from this process, but it can be disabled altogether using `NeverSchedule`. [PR #718](https://github.com/riverqueue/river/pull/718).
+- Periodic jobs now have a `"periodic": true` attribute set in their metadata to make them more easily distinguishable from other types of jobs. [PR #728](https://github.com/riverqueue/river/pull/728).
+- Snoozing a job now causes its `attempt` to be _decremented_, whereas previously the `max_attempts` would be incremented. In either case, this avoids allowing a snooze to exhaust a job's retries; however the new behavior also avoids potential issues with wrapping the `max_attempts` value, and makes it simpler to implement a `RetryPolicy` based on either `attempt` or `max_attempts`. The number of snoozes is also tracked in the job's metadata as `snoozes` for debugging purposes.
+
+  The implementation of the builtin `RetryPolicy` implementations is not changed, so this change should not cause any user-facing breakage unless you're relying on `attempt - len(errors)` for some reason. [PR #730](https://github.com/riverqueue/river/pull/730).
+
+- `ByPeriod` uniqueness is now based off a job's `ScheduledAt` instead of the current time if it has a value. [PR #734](https://github.com/riverqueue/river/pull/734).
+
 ## [0.15.0] - 2024-12-26
 
 ### Added

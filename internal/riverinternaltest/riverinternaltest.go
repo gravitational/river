@@ -4,7 +4,6 @@ package riverinternaltest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -160,7 +159,8 @@ func DrainContinuously[T any](drainChan <-chan T) func() []T {
 
 // TestDB acquires a dedicated test database for the duration of the test. If an
 // error occurs, the test fails. The test database will be automatically
-// returned to the pool at the end of the test and the pgxpool will be closed.
+// returned to the pool at the end of the test. If the pool was closed, it will
+// be recreated.
 func TestDB(ctx context.Context, tb testing.TB) *pgxpool.Pool {
 	tb.Helper()
 
@@ -172,9 +172,6 @@ func TestDB(ctx context.Context, tb testing.TB) *pgxpool.Pool {
 		tb.Fatalf("Failed to acquire pool for test DB: %v", err)
 	}
 	tb.Cleanup(testPool.Release)
-
-	// Also close the pool just to ensure nothing is still active on it:
-	tb.Cleanup(testPool.Pool().Close)
 
 	return testPool.Pool()
 }
@@ -221,44 +218,7 @@ func TestTx(ctx context.Context, tb testing.TB) pgx.Tx {
 		return dbPool
 	}
 
-	tx, err := getPool().Begin(ctx)
-	require.NoError(tb, err)
-
-	tb.Cleanup(func() {
-		err := tx.Rollback(ctx)
-
-		if err == nil {
-			return
-		}
-
-		// Try to look for an error on rollback because it does occasionally
-		// reveal a real problem in the way a test is written. However, allow
-		// tests to roll back their transaction early if they like, so ignore
-		// `ErrTxClosed`.
-		if errors.Is(err, pgx.ErrTxClosed) {
-			return
-		}
-
-		// In case of a cancelled context during a database operation, which
-		// happens in many tests, pgx seems to not only roll back the
-		// transaction, but closes the connection, and returns this error on
-		// rollback. Allow this error since it's hard to prevent it in our flows
-		// that use contexts heavily.
-		if err.Error() == "conn closed" {
-			return
-		}
-
-		// Similar to the above, but a newly appeared error that wraps the
-		// above. As far as I can tell, no error variables are available to use
-		// with `errors.Is`.
-		if err.Error() == "failed to deallocate cached statement(s): conn closed" {
-			return
-		}
-
-		require.NoError(tb, err)
-	})
-
-	return tx
+	return riversharedtest.TestTxPool(ctx, tb, getPool())
 }
 
 // TruncateRiverTables truncates River tables in the target database. This is
@@ -282,8 +242,18 @@ func TruncateRiverTables(ctx context.Context, pool *pgxpool.Pool) error {
 // amongst all packages. e.g. Configures a manager for test databases on setup,
 // and checks for no goroutine leaks on teardown.
 func WrapTestMain(m *testing.M) {
+	poolConfig := DatabaseConfig("river_test")
+	// Use a smaller number of conns per pool, because otherwise we could have
+	// NUM_CPU pools, each with NUM_CPU connections, and that's a lot of
+	// connections if there are many CPUs.
+	poolConfig.MaxConns = 4
+	// Pre-initialize 1 connection per pool.
+	poolConfig.MinConns = 1
+
 	var err error
-	dbManager, err = testdb.NewManager(DatabaseConfig("river_test"), dbPoolMaxConns, nil, TruncateRiverTables)
+	// Allow up to one database per concurrent test, plus two for overhead:
+	maxTestDBs := int32(runtime.GOMAXPROCS(0)) + 2 //nolint:gosec
+	dbManager, err = testdb.NewManager(poolConfig, maxTestDBs, nil, TruncateRiverTables)
 	if err != nil {
 		log.Fatal(err)
 	}

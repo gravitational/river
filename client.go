@@ -621,14 +621,8 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		testSignals:          clientTestSignals{},
 		workCancel:           func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 	}
-<<<<<<< HEAD
-	client.queues = &QueueBundle{
-		addProducer:    client.addProducer,
-		removeProducer: client.removeProducer,
-	}
-=======
-	client.queues = &QueueBundle{addProducer: client.addProducer, clientWillExecuteJobs: config.willExecuteJobs()}
->>>>>>> master
+
+	client.queues = &QueueBundle{addProducer: client.addProducer, clientWillExecuteJobs: config.willExecuteJobs(), removeProducer: client.removeProducer}
 
 	baseservice.Init(archetype, &client.baseService)
 	client.baseService.Name = "Client" // Have to correct the name because base service isn't embedded like it usually is
@@ -2317,11 +2311,8 @@ type QueueBundle struct {
 	// Function that adds a producer to the associated client.
 	addProducer func(queueName string, queueConfig QueueConfig) *producer
 
-<<<<<<< HEAD
-	removeProducer func(queueName string)
-=======
+	removeProducer        func(queueName string)
 	clientWillExecuteJobs bool
->>>>>>> master
 
 	fetchCtx context.Context //nolint:containedctx
 

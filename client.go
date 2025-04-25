@@ -1,6 +1,7 @@
 package river
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,9 +15,11 @@ import (
 
 	"github.com/riverqueue/river/internal/dblist"
 	"github.com/riverqueue/river/internal/dbunique"
+	"github.com/riverqueue/river/internal/hooklookup"
 	"github.com/riverqueue/river/internal/jobcompleter"
 	"github.com/riverqueue/river/internal/leadership"
 	"github.com/riverqueue/river/internal/maintenance"
+	"github.com/riverqueue/river/internal/middlewarelookup"
 	"github.com/riverqueue/river/internal/notifier"
 	"github.com/riverqueue/river/internal/notifylimiter"
 	"github.com/riverqueue/river/internal/rivercommon"
@@ -45,6 +48,21 @@ const (
 	QueueDefault       = rivercommon.QueueDefault
 	QueueNumWorkersMax = 10_000
 )
+
+// TestConfig contains configuration specific to test environments.
+type TestConfig struct {
+	// DisableUniqueEnforcement disables the application of unique job
+	// constraints. This is useful for testing scenarios when testing a worker
+	// that typically uses uniqueness, but where enforcing uniqueness would cause
+	// conflicts with parallel test execution.
+	//
+	// The [rivertest.Worker] type automatically disables uniqueness enforcement
+	// when creating jobs.
+	DisableUniqueEnforcement bool
+
+	// Time is a time generator to make time stubbable in tests.
+	Time rivertype.TimeGenerator
+}
 
 // Config is the configuration for a Client.
 //
@@ -141,6 +159,9 @@ type Config struct {
 
 	// JobInsertMiddleware are optional functions that can be called around job
 	// insertion.
+	//
+	// Deprecated: Prefer the use of Middleware instead (which may contain
+	// instances of rivertype.JobInsertMiddleware).
 	JobInsertMiddleware []rivertype.JobInsertMiddleware
 
 	// JobTimeout is the maximum amount of time a job is allowed to run before its
@@ -150,6 +171,27 @@ type Config struct {
 	//
 	// Defaults to 1 minute.
 	JobTimeout time.Duration
+
+	// Hooks are functions that may activate at certain points during a job's
+	// lifecycle (see rivertype.Hook), installed globally.
+	//
+	// The effect of hooks in this list will depend on the specific hook
+	// interfaces they implement, so for example implementing
+	// rivertype.HookInsertBegin will cause the hook to be invoked before a job
+	// is inserted, or implementing rivertype.HookWorkBegin will cause it to be
+	// invoked before a job is worked. Hook structs may implement multiple hook
+	// interfaces.
+	//
+	// Order in this list is significant. A hook that appears first will be
+	// entered before a hook that appears later. For any particular phase, order
+	// is relevant only for hooks that will run for that phase. For example, if
+	// two rivertype.HookInsertBegin are separated by a rivertype.HookWorkBegin,
+	// during job insertion those two outer hooks will run one after another,
+	// and the work hook between them will not run. When a job is worked, the
+	// work hook runs and the insertion hooks on either side of it are skipped.
+	//
+	// Jobs may have their own specific hooks by implementing JobArgsWithHooks.
+	Hooks []rivertype.Hook
 
 	// Logger is the structured logger to use for logging purposes. If none is
 	// specified, logs will be emitted to STDOUT with messages at warn level
@@ -163,6 +205,26 @@ type Config struct {
 	//
 	// If not specified, defaults to 25 (MaxAttemptsDefault).
 	MaxAttempts int
+
+	// Middleware contains middleware that may activate at certain points during
+	// a job's lifecycle (see rivertype.Middleware), installed globally.
+	//
+	// The effect of middleware in this list will depend on the specific
+	// middleware interfaces they implement, so for example implementing
+	// rivertype.JobInsertMiddleware will cause the middleware to be invoked
+	// when jobs are inserted, and implementing rivertype.WorkerMiddleware will
+	// cause it to be invoked when a job is worked. Middleware structs may
+	// implement multiple middleware interfaces.
+	//
+	// Order in this list is significant. Middleware that appears first will be
+	// entered before middleware that appears later. For any particular phase,
+	// order is relevant only for middlewares that will run for that phase. For
+	// example, if two rivertype.JobInsertMiddleware are separated by a
+	// rivertype.WorkerMiddleware, during job insertion those two outer
+	// middlewares will run one after another, and the work middleware between
+	// them will not run. When a job is worked, the work middleware runs and the
+	// insertion middlewares on either side of it are skipped.
+	Middleware []rivertype.Middleware
 
 	// PeriodicJobs are a set of periodic jobs to run at the specified intervals
 	// in the client.
@@ -220,6 +282,27 @@ type Config struct {
 	// Defaults to DefaultRetryPolicy.
 	RetryPolicy ClientRetryPolicy
 
+	// schema is a non-standard schema where River tables are located. All table
+	// references in database queries will use this value as a prefix.
+	//
+	// Defaults to empty, which causes the client to look for tables using the
+	// setting of Postgres `search_path`.
+	schema string
+
+	// SkipUnknownJobCheck is a flag to control whether the client should skip
+	// checking to see if a registered worker exists in the client's worker bundle
+	// for a job arg prior to insertion.
+	//
+	// This can be set to true to allow a client to insert jobs which are
+	// intended to be worked by a different client which effectively makes
+	// the client's insertion behavior mimic that of an insert-only client.
+	//
+	// Defaults to false.
+	SkipUnknownJobCheck bool
+
+	// Test holds configuration specific to test environments.
+	Test TestConfig
+
 	// TestOnly can be set to true to disable certain features that are useful
 	// in production, but which may be harmful to tests, in ways like having the
 	// effect of making them slower. It should not be used outside of test
@@ -241,14 +324,73 @@ type Config struct {
 
 	// WorkerMiddleware are optional functions that can be called around
 	// all job executions.
+	//
+	// Deprecated: Prefer the use of Middleware instead (which may contain
+	// instances of rivertype.WorkerMiddleware).
 	WorkerMiddleware []rivertype.WorkerMiddleware
 
 	// Scheduler run interval. Shared between the scheduler and producer/job
 	// executors, but not currently exposed for configuration.
 	schedulerInterval time.Duration
+}
 
-	// Time generator to make time stubbable in tests.
-	time baseservice.TimeGenerator
+// WithDefaults returns a copy of the Config with all default values applied.
+func (c *Config) WithDefaults() *Config {
+	if c == nil {
+		c = &Config{}
+	}
+
+	// Use the existing logger if set, otherwise create a default one.
+	logger := c.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+		}))
+	}
+
+	// Compute the default rescue value. For convenience, if JobTimeout is specified
+	// but RescueStuckJobsAfter is not set (or less than 1) and JobTimeout is large, use
+	// JobTimeout + maintenance.JobRescuerRescueAfterDefault as the default.
+	rescueAfter := maintenance.JobRescuerRescueAfterDefault
+	if c.JobTimeout > 0 && c.RescueStuckJobsAfter < 1 && c.JobTimeout > c.RescueStuckJobsAfter {
+		rescueAfter = c.JobTimeout + maintenance.JobRescuerRescueAfterDefault
+	}
+
+	// Set default retry policy if none is provided.
+	retryPolicy := c.RetryPolicy
+	if retryPolicy == nil {
+		retryPolicy = &DefaultClientRetryPolicy{}
+	}
+
+	return &Config{
+		AdvisoryLockPrefix:          c.AdvisoryLockPrefix,
+		CancelledJobRetentionPeriod: valutil.ValOrDefault(c.CancelledJobRetentionPeriod, maintenance.CancelledJobRetentionPeriodDefault),
+		CompletedJobRetentionPeriod: valutil.ValOrDefault(c.CompletedJobRetentionPeriod, maintenance.CompletedJobRetentionPeriodDefault),
+		DiscardedJobRetentionPeriod: valutil.ValOrDefault(c.DiscardedJobRetentionPeriod, maintenance.DiscardedJobRetentionPeriodDefault),
+		ErrorHandler:                c.ErrorHandler,
+		FetchCooldown:               valutil.ValOrDefault(c.FetchCooldown, FetchCooldownDefault),
+		FetchPollInterval:           valutil.ValOrDefault(c.FetchPollInterval, FetchPollIntervalDefault),
+		ID:                          valutil.ValOrDefaultFunc(c.ID, func() string { return defaultClientID(time.Now().UTC()) }),
+		Hooks:                       c.Hooks,
+		JobInsertMiddleware:         c.JobInsertMiddleware,
+		JobTimeout:                  valutil.ValOrDefault(c.JobTimeout, JobTimeoutDefault),
+		Logger:                      logger,
+		MaxAttempts:                 valutil.ValOrDefault(c.MaxAttempts, MaxAttemptsDefault),
+		Middleware:                  c.Middleware,
+		PeriodicJobs:                c.PeriodicJobs,
+		PollOnly:                    c.PollOnly,
+		Queues:                      c.Queues,
+		ReindexerSchedule:           c.ReindexerSchedule,
+		RescueStuckJobsAfter:        valutil.ValOrDefault(c.RescueStuckJobsAfter, rescueAfter),
+		RetryPolicy:                 retryPolicy,
+		schema:                      c.schema,
+		SkipUnknownJobCheck:         c.SkipUnknownJobCheck,
+		Test:                        c.Test,
+		TestOnly:                    c.TestOnly,
+		WorkerMiddleware:            c.WorkerMiddleware,
+		Workers:                     c.Workers,
+		schedulerInterval:           valutil.ValOrDefault(c.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
+	}
 }
 
 func (c *Config) validate() error {
@@ -278,6 +420,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxAttempts < 0 {
 		return errors.New("MaxAttempts cannot be less than zero")
+	}
+	if len(c.Middleware) > 0 && (len(c.JobInsertMiddleware) > 0 || len(c.WorkerMiddleware) > 0) {
+		return errors.New("only one of the pair JobInsertMiddleware/WorkerMiddleware or Middleware may be provided (Middleware is recommended, and may contain both job insert and worker middleware)")
 	}
 	if c.RescueStuckJobsAfter < 0 {
 		return errors.New("RescueStuckJobsAfter cannot be less than zero")
@@ -341,21 +486,24 @@ type Client[TTx any] struct {
 	baseService   baseservice.BaseService
 	baseStartStop startstop.BaseStartStop
 
-	completer            jobcompleter.JobCompleter
-	config               *Config
-	driver               riverdriver.Driver[TTx]
-	elector              *leadership.Elector
-	insertNotifyLimiter  *notifylimiter.Limiter
-	notifier             *notifier.Notifier // may be nil in poll-only mode
-	periodicJobs         *PeriodicJobBundle
-	pilot                riverpilot.Pilot
-	producersByQueueName map[string]*producer
-	queueMaintainer      *maintenance.QueueMaintainer
-	queues               *QueueBundle
-	services             []startstop.Service
-	stopped              <-chan struct{}
-	subscriptionManager  *subscriptionManager
-	testSignals          clientTestSignals
+	completer              jobcompleter.JobCompleter
+	config                 *Config
+	driver                 riverdriver.Driver[TTx]
+	elector                *leadership.Elector
+	hookLookupByJob        *hooklookup.JobHookLookup
+	hookLookupGlobal       hooklookup.HookLookupInterface
+	insertNotifyLimiter    *notifylimiter.Limiter
+	middlewareLookupGlobal middlewarelookup.MiddlewareLookupInterface
+	notifier               *notifier.Notifier // may be nil in poll-only mode
+	periodicJobs           *PeriodicJobBundle
+	pilot                  riverpilot.Pilot
+	producersByQueueName   map[string]*producer
+	queueMaintainer        *maintenance.QueueMaintainer
+	queues                 *QueueBundle
+	services               []startstop.Service
+	stopped                <-chan struct{}
+	subscriptionManager    *subscriptionManager
+	testSignals            clientTestSignals
 
 	// workCancel cancels the context used for all work goroutines. Normal Stop
 	// does not cancel that context.
@@ -443,89 +591,87 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		return nil, errMissingConfig
 	}
 
-	logger := config.Logger
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelWarn,
-		}))
-	}
-
-	retryPolicy := config.RetryPolicy
-	if retryPolicy == nil {
-		retryPolicy = &DefaultClientRetryPolicy{}
-	}
-
-	// For convenience, in case the user's specified a large JobTimeout but no
-	// RescueStuckJobsAfter, since RescueStuckJobsAfter must be greater than
-	// JobTimeout, set a reasonable default value that's longer than JobTimeout.
-	rescueAfter := maintenance.JobRescuerRescueAfterDefault
-	if config.JobTimeout > 0 && config.RescueStuckJobsAfter < 1 && config.JobTimeout > config.RescueStuckJobsAfter {
-		rescueAfter = config.JobTimeout + maintenance.JobRescuerRescueAfterDefault
-	}
-
-	// Create a new version of config with defaults filled in. This replaces the
-	// original object, so everything that we care about must be initialized
-	// here, even if it's only carrying over the original value.
-	config = &Config{
-		AdvisoryLockPrefix:          config.AdvisoryLockPrefix,
-		CancelledJobRetentionPeriod: valutil.ValOrDefault(config.CancelledJobRetentionPeriod, maintenance.CancelledJobRetentionPeriodDefault),
-		CompletedJobRetentionPeriod: valutil.ValOrDefault(config.CompletedJobRetentionPeriod, maintenance.CompletedJobRetentionPeriodDefault),
-		DiscardedJobRetentionPeriod: valutil.ValOrDefault(config.DiscardedJobRetentionPeriod, maintenance.DiscardedJobRetentionPeriodDefault),
-		ErrorHandler:                config.ErrorHandler,
-		FetchCooldown:               valutil.ValOrDefault(config.FetchCooldown, FetchCooldownDefault),
-		FetchPollInterval:           valutil.ValOrDefault(config.FetchPollInterval, FetchPollIntervalDefault),
-		ID:                          valutil.ValOrDefaultFunc(config.ID, func() string { return defaultClientID(time.Now().UTC()) }),
-		JobInsertMiddleware:         config.JobInsertMiddleware,
-		JobTimeout:                  valutil.ValOrDefault(config.JobTimeout, JobTimeoutDefault),
-		Logger:                      logger,
-		MaxAttempts:                 valutil.ValOrDefault(config.MaxAttempts, MaxAttemptsDefault),
-		PeriodicJobs:                config.PeriodicJobs,
-		PollOnly:                    config.PollOnly,
-		Queues:                      config.Queues,
-		ReindexerSchedule:           config.ReindexerSchedule,
-		RescueStuckJobsAfter:        valutil.ValOrDefault(config.RescueStuckJobsAfter, rescueAfter),
-		RetryPolicy:                 retryPolicy,
-		TestOnly:                    config.TestOnly,
-		Workers:                     config.Workers,
-		WorkerMiddleware:            config.WorkerMiddleware,
-		schedulerInterval:           valutil.ValOrDefault(config.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
-		time:                        config.time,
-	}
+	config = config.WithDefaults()
 
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
 
 	archetype := baseservice.NewArchetype(config.Logger)
-	if config.time != nil {
-		archetype.Time = config.time
+	if config.Test.Time != nil {
+		if withStub, ok := config.Test.Time.(baseservice.TimeGeneratorWithStub); ok {
+			archetype.Time = withStub
+		} else {
+			archetype.Time = &baseservice.TimeGeneratorWithStubWrapper{TimeGenerator: config.Test.Time}
+		}
+	}
+
+	for _, hook := range config.Hooks {
+		if withBaseService, ok := hook.(baseservice.WithBaseService); ok {
+			baseservice.Init(archetype, withBaseService)
+		}
 	}
 
 	client := &Client[TTx]{
 		config:               config,
 		driver:               driver,
+		hookLookupByJob:      hooklookup.NewJobHookLookup(),
+		hookLookupGlobal:     hooklookup.NewHookLookup(config.Hooks),
 		producersByQueueName: make(map[string]*producer),
 		testSignals:          clientTestSignals{},
 		workCancel:           func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 	}
-	client.queues = &QueueBundle{
-		addProducer:    client.addProducer,
-		removeProducer: client.removeProducer,
-	}
+
+	client.queues = &QueueBundle{addProducer: client.addProducer, clientWillExecuteJobs: config.willExecuteJobs(), removeProducer: client.removeProducer}
 
 	baseservice.Init(archetype, &client.baseService)
 	client.baseService.Name = "Client" // Have to correct the name because base service isn't embedded like it usually is
 	client.insertNotifyLimiter = notifylimiter.NewLimiter(archetype, config.FetchCooldown)
 
-	plugin, _ := driver.(driverPlugin[TTx])
-	if plugin != nil {
-		plugin.PluginInit(archetype, client)
-		client.pilot = plugin.PluginPilot()
+	// Validation ensures that config.JobInsertMiddleware/WorkerMiddleware or
+	// the more abstract config.Middleware for middleware are set, but not both,
+	// so in practice we never append all three of these to each other.
+	{
+		middleware := config.Middleware
+		for _, jobInsertMiddleware := range config.JobInsertMiddleware {
+			middleware = append(middleware, jobInsertMiddleware)
+		}
+	outerLoop:
+		for _, workerMiddleware := range config.WorkerMiddleware {
+			// Don't add the middleware if it also implements JobInsertMiddleware
+			// and the instance has been added to config.JobInsertMiddleware. This
+			// is a hedge to make sure we don't accidentally double add middleware
+			// as we've converted over to the unified config.Middleware setting.
+			if workerMiddlewareAsJobInsertMiddleware, ok := workerMiddleware.(rivertype.JobInsertMiddleware); ok {
+				for _, jobInsertMiddleware := range config.JobInsertMiddleware {
+					if workerMiddlewareAsJobInsertMiddleware == jobInsertMiddleware {
+						continue outerLoop
+					}
+				}
+			}
+
+			middleware = append(middleware, workerMiddleware)
+		}
+
+		for _, middleware := range middleware {
+			if withBaseService, ok := middleware.(baseservice.WithBaseService); ok {
+				baseservice.Init(archetype, withBaseService)
+			}
+		}
+
+		client.middlewareLookupGlobal = middlewarelookup.NewMiddlewareLookup(middleware)
+	}
+
+	pluginDriver, _ := driver.(driverPlugin[TTx])
+	if pluginDriver != nil {
+		pluginDriver.PluginInit(archetype)
+		client.pilot = pluginDriver.PluginPilot()
 	}
 	if client.pilot == nil {
 		client.pilot = &riverpilot.StandardPilot{}
 	}
 	client.pilot.PilotInit(archetype)
+	pluginPilot, _ := client.pilot.(pilotPlugin)
 
 	// There are a number of internal components that are only needed/desired if
 	// we're actually going to be working jobs (as opposed to just enqueueing
@@ -544,11 +690,11 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			// uses listen/notify. Instead, each service polls for changes it's
 			// interested in. e.g. Elector polls to see if leader has expired.
 			if !config.PollOnly {
-				client.notifier = notifier.New(archetype, driver.GetListener())
+				client.notifier = notifier.New(archetype, driver.GetListener(config.schema))
 				client.services = append(client.services, client.notifier)
 			}
 		} else {
-			logger.Info("Driver does not support listener; entering poll only mode")
+			config.Logger.Info("Driver does not support listener; entering poll only mode")
 		}
 
 		client.elector = leadership.NewElector(archetype, driver.GetExecutor(), client.notifier, &leadership.Config{
@@ -566,8 +712,8 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		client.services = append(client.services,
 			startstop.StartStopFunc(client.handleLeadershipChangeLoop))
 
-		if plugin != nil {
-			client.services = append(client.services, plugin.PluginServices()...)
+		if pluginPilot != nil {
+			client.services = append(client.services, pluginPilot.PluginServices()...)
 		}
 
 		//
@@ -581,6 +727,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 				CancelledJobRetentionPeriod: config.CancelledJobRetentionPeriod,
 				CompletedJobRetentionPeriod: config.CompletedJobRetentionPeriod,
 				DiscardedJobRetentionPeriod: config.DiscardedJobRetentionPeriod,
+				Schema:                      config.schema,
 				Timeout:                     config.JobCleanerTimeout,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobCleaner)
@@ -589,8 +736,9 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 
 		{
 			jobRescuer := maintenance.NewRescuer(archetype, &maintenance.JobRescuerConfig{
-				ClientRetryPolicy: retryPolicy,
+				ClientRetryPolicy: config.RetryPolicy,
 				RescueAfter:       config.RescueStuckJobsAfter,
+				Schema:            config.schema,
 				WorkUnitFactoryFunc: func(kind string) workunit.WorkUnitFactory {
 					if workerInfo, ok := config.Workers.workersMap[kind]; ok {
 						return workerInfo.workUnitFactory
@@ -606,6 +754,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			jobScheduler := maintenance.NewJobScheduler(archetype, &maintenance.JobSchedulerConfig{
 				Interval:     config.schedulerInterval,
 				NotifyInsert: client.maybeNotifyInsertForQueues,
+				Schema:       config.schema,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobScheduler)
 			client.testSignals.jobScheduler = &jobScheduler.TestSignals
@@ -626,6 +775,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		{
 			queueCleaner := maintenance.NewQueueCleaner(archetype, &maintenance.QueueCleanerConfig{
 				RetentionPeriod: maintenance.QueueRetentionPeriodDefault,
+				Schema:          config.schema,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, queueCleaner)
 			client.testSignals.queueCleaner = &queueCleaner.TestSignals
@@ -637,13 +787,16 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 				scheduleFunc = config.ReindexerSchedule.Next
 			}
 
-			reindexer := maintenance.NewReindexer(archetype, &maintenance.ReindexerConfig{ScheduleFunc: scheduleFunc}, driver.GetExecutor())
+			reindexer := maintenance.NewReindexer(archetype, &maintenance.ReindexerConfig{
+				ScheduleFunc: scheduleFunc,
+				Schema:       config.schema,
+			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, reindexer)
 			client.testSignals.reindexer = &reindexer.TestSignals
 		}
 
-		if plugin != nil {
-			maintenanceServices = append(maintenanceServices, plugin.PluginMaintenanceServices()...)
+		if pluginPilot != nil {
+			maintenanceServices = append(maintenanceServices, pluginPilot.PluginMaintenanceServices()...)
 		}
 
 		// Not added to the main services list because the queue maintainer is
@@ -740,24 +893,24 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		// We use separate contexts for fetching and working to allow for a graceful
 		// stop. Both inherit from the provided context, so if it's cancelled, a
 		// more aggressive stop will be initiated.
-		workCtx, workCancel := context.WithCancelCause(withClient[TTx](ctx, c))
+		workCtx, workCancel := context.WithCancelCause(withClient(ctx, c))
 
 		if err := startstop.StartAll(fetchCtx, c.services...); err != nil {
+			workCancel(err)
 			stopServicesOnError()
 			return err
 		}
 
 		for _, producer := range c.producersByQueueName {
-			producer := producer
-
 			if err := producer.StartWorkContext(fetchCtx, workCtx); err != nil {
+				workCancel(err)
 				startstop.StopAllParallel(producersAsServices()...)
 				stopServicesOnError()
 				return err
 			}
 		}
 
-		c.queues.fetchCtx = fetchCtx //nolint:fatcontext
+		c.queues.fetchCtx = fetchCtx
 		c.queues.workCtx = workCtx
 		c.workCancel = workCancel
 
@@ -765,7 +918,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	}(); err != nil {
 		defer stopped()
 		if errors.Is(context.Cause(fetchCtx), startstop.ErrStop) {
-			return rivercommon.ErrShutdown
+			return nil
 		}
 		return err
 	}
@@ -804,6 +957,8 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": Stopping producers")
 		startstop.StopAllParallel(producersAsServices()...)
 		c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": All producers stopped")
+
+		c.workCancel(rivercommon.ErrStop)
 
 		// Stop all mainline services where stop order isn't important.
 		startstop.StopAllParallel(append(
@@ -860,7 +1015,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // instead.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	c.baseService.Logger.InfoContext(ctx, c.baseService.Name+": Hard stop started; cancelling all work")
-	c.workCancel(rivercommon.ErrShutdown)
+	c.workCancel(rivercommon.ErrStop)
 
 	shouldStop, stopped, finalizeStop := c.baseStartStop.StopInit()
 	if !shouldStop {
@@ -931,7 +1086,7 @@ type SubscribeConfig struct {
 // Special internal variant that lets us inject an overridden size.
 func (c *Client[TTx]) SubscribeConfig(config *SubscribeConfig) (<-chan *Event, func()) {
 	if c.subscriptionManager == nil {
-		panic("created a subscription on a client that will never work jobs (Workers not configured)")
+		panic("created a subscription on a client that will never work jobs (Queues not configured)")
 	}
 
 	return c.subscriptionManager.SubscribeConfig(config)
@@ -1110,6 +1265,7 @@ func (c *Client[TTx]) jobCancel(ctx context.Context, exec riverdriver.Executor, 
 		ID:                jobID,
 		CancelAttemptedAt: c.baseService.Time.NowUTC(),
 		ControlTopic:      string(notifier.NotificationTopicControl),
+		Schema:            c.config.schema,
 	})
 }
 
@@ -1117,7 +1273,10 @@ func (c *Client[TTx]) jobCancel(ctx context.Context, exec riverdriver.Executor, 
 // deleted row if it was deleted. Jobs in the running state are not deleted,
 // instead returning rivertype.ErrJobRunning.
 func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.driver.GetExecutor().JobDelete(ctx, id)
+	return c.driver.GetExecutor().JobDelete(ctx, &riverdriver.JobDeleteParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // JobDelete deletes the job with the given ID from the database, returning the
@@ -1127,20 +1286,29 @@ func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRo
 // until the transaction commits, and if the transaction rolls back, so too is
 // the deleted job.
 func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.driver.UnwrapExecutor(tx).JobDelete(ctx, id)
+	return c.driver.UnwrapExecutor(tx).JobDelete(ctx, &riverdriver.JobDeleteParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // JobGet fetches a single job by its ID. Returns the up-to-date JobRow for the
 // specified jobID if it exists. Returns ErrNotFound if the job doesn't exist.
 func (c *Client[TTx]) JobGet(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.driver.GetExecutor().JobGetByID(ctx, id)
+	return c.driver.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // JobGetTx fetches a single job by its ID, within a transaction. Returns the
 // up-to-date JobRow for the specified jobID if it exists. Returns ErrNotFound
 // if the job doesn't exist.
 func (c *Client[TTx]) JobGetTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.driver.UnwrapExecutor(tx).JobGetByID(ctx, id)
+	return c.driver.UnwrapExecutor(tx).JobGetByID(ctx, &riverdriver.JobGetByIDParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // JobRetry updates the job with the given ID to make it immediately available
@@ -1152,7 +1320,10 @@ func (c *Client[TTx]) JobGetTx(ctx context.Context, tx TTx, id int64) (*rivertyp
 // MaxAttempts is also incremented by one if the job has already exhausted its
 // max attempts.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.driver.GetExecutor().JobRetry(ctx, id)
+	return c.driver.GetExecutor().JobRetry(ctx, &riverdriver.JobRetryParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // JobRetryTx updates the job with the given ID to make it immediately available
@@ -1169,7 +1340,10 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow
 // MaxAttempts is also incremented by one if the job has already exhausted its
 // max attempts.
 func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.driver.UnwrapExecutor(tx).JobRetry(ctx, id)
+	return c.driver.UnwrapExecutor(tx).JobRetry(ctx, &riverdriver.JobRetryParams{
+		ID:     id,
+		Schema: c.config.schema,
+	})
 }
 
 // ID returns the unique ID of this client as set in its config or
@@ -1198,9 +1372,9 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	// by drivers as necessary.
 	createdAt := archetype.Time.NowUTCOrNil()
 
-	maxAttempts := valutil.FirstNonZero(insertOpts.MaxAttempts, jobInsertOpts.MaxAttempts, config.MaxAttempts)
-	priority := valutil.FirstNonZero(insertOpts.Priority, jobInsertOpts.Priority, rivercommon.PriorityDefault)
-	queue := valutil.FirstNonZero(insertOpts.Queue, jobInsertOpts.Queue, rivercommon.QueueDefault)
+	maxAttempts := cmp.Or(insertOpts.MaxAttempts, jobInsertOpts.MaxAttempts, config.MaxAttempts)
+	priority := cmp.Or(insertOpts.Priority, jobInsertOpts.Priority, rivercommon.PriorityDefault)
+	queue := cmp.Or(insertOpts.Queue, jobInsertOpts.Queue, rivercommon.QueueDefault)
 
 	if err := validateQueueName(queue); err != nil {
 		return nil, err
@@ -1227,9 +1401,12 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		return nil, errors.New("priority must be between 1 and 4")
 	}
 
-	uniqueOpts := insertOpts.UniqueOpts
-	if uniqueOpts.isEmpty() {
-		uniqueOpts = jobInsertOpts.UniqueOpts
+	var uniqueOpts UniqueOpts
+	if !config.Test.DisableUniqueEnforcement {
+		uniqueOpts = insertOpts.UniqueOpts
+		if uniqueOpts.isEmpty() {
+			uniqueOpts = jobInsertOpts.UniqueOpts
+		}
 	}
 	if err := uniqueOpts.validate(); err != nil {
 		return nil, err
@@ -1370,14 +1547,6 @@ type InsertManyParams struct {
 //	if err != nil {
 //		// handle error
 //	}
-//
-// Job uniqueness is not respected when using InsertMany due to unique inserts
-// using an internal transaction and advisory lock that might lead to
-// significant lock contention. Insert unique jobs using Insert instead.
-//
-// Job uniqueness is not respected when using InsertMany due to unique inserts
-// using an internal transaction and advisory lock that might lead to
-// significant lock contention. Insert unique jobs using Insert instead.
 func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
 	if !c.driver.HasPool() {
 		return nil, errNoDriverDBPool
@@ -1415,10 +1584,6 @@ func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams)
 //		// handle error
 //	}
 //
-// Job uniqueness is not respected when using InsertMany due to unique inserts
-// using an internal transaction and advisory lock that might lead to
-// significant lock contention. Insert unique jobs using Insert instead.
-//
 // This variant lets a caller insert jobs atomically alongside other database
 // changes. An inserted job isn't visible to be worked until the transaction
 // commits, and if the transaction rolls back, so too is the inserted job.
@@ -1444,7 +1609,10 @@ func (c *Client[TTx]) validateParamsAndInsertMany(ctx context.Context, tx riverd
 // by the PeriodicJobEnqueuer.
 func (c *Client[TTx]) insertMany(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
 	return c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
-		results, err := c.pilot.JobInsertMany(ctx, tx, insertParams)
+		results, err := c.pilot.JobInsertMany(ctx, tx, &riverdriver.JobInsertFastManyParams{
+			Jobs:   insertParams,
+			Schema: c.config.schema,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1468,6 +1636,17 @@ func (c *Client[TTx]) insertManyShared(
 	execute func(context.Context, []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error),
 ) ([]*rivertype.JobInsertResult, error) {
 	doInner := func(ctx context.Context) ([]*rivertype.JobInsertResult, error) {
+		for _, params := range insertParams {
+			for _, hook := range append(
+				c.hookLookupGlobal.ByHookKind(hooklookup.HookKindInsertBegin),
+				c.hookLookupByJob.ByJobArgs(params.Args).ByHookKind(hooklookup.HookKindInsertBegin)...,
+			) {
+				if err := hook.(rivertype.HookInsertBegin).InsertBegin(ctx, params); err != nil { //nolint:forcetypeassert
+					return nil, err
+				}
+			}
+		}
+
 		finalInsertParams := sliceutil.Map(insertParams, func(params *rivertype.JobInsertParams) *riverdriver.JobInsertFastParams {
 			return (*riverdriver.JobInsertFastParams)(params)
 		})
@@ -1488,12 +1667,13 @@ func (c *Client[TTx]) insertManyShared(
 		return results, nil
 	}
 
-	if len(c.config.JobInsertMiddleware) > 0 {
+	jobInsertMiddleware := c.middlewareLookupGlobal.ByMiddlewareKind(middlewarelookup.MiddlewareKindJobInsert)
+	if len(jobInsertMiddleware) > 0 {
 		// Wrap middlewares in reverse order so the one defined first is wrapped
 		// as the outermost function and is first to receive the operation.
-		for i := len(c.config.JobInsertMiddleware) - 1; i >= 0; i-- {
-			middlewareItem := c.config.JobInsertMiddleware[i] // capture the current middleware item
-			previousDoInner := doInner                        // Capture the current doInner function
+		for i := len(jobInsertMiddleware) - 1; i >= 0; i-- {
+			middlewareItem := jobInsertMiddleware[i].(rivertype.JobInsertMiddleware) //nolint:forcetypeassert // capture the current middleware item
+			previousDoInner := doInner                                               // Capture the current doInner function
 			doInner = func(ctx context.Context) ([]*rivertype.JobInsertResult, error) {
 				return middlewareItem.InsertMany(ctx, insertParams, previousDoInner)
 			}
@@ -1543,9 +1723,8 @@ func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*rivertype.
 //		// handle error
 //	}
 //
-// Job uniqueness is supported using this path, but unlike with `InsertMany`
-// unique conflicts cannot be handled gracefully. If a unique constraint is
-// violated, the operation will fail and no jobs will be inserted.
+// Unlike with `InsertMany`, unique conflicts cannot be handled gracefully. If a
+// unique constraint is violated, the operation will fail and no jobs will be inserted.
 func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyParams) (int, error) {
 	if !c.driver.HasPool() {
 		return 0, errNoDriverDBPool
@@ -1588,9 +1767,9 @@ func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyPar
 // changes. An inserted job isn't visible to be worked until the transaction
 // commits, and if the transaction rolls back, so too is the inserted job.
 //
-// Job uniqueness is supported using this path, but unlike with `InsertManyTx`
-// unique conflicts cannot be handled gracefully. If a unique constraint is
-// violated, the operation will fail and no jobs will be inserted.
+// Unlike with `InsertManyTx`, unique conflicts cannot be handled gracefully. If
+// a unique constraint is violated, the operation will fail and no jobs will be
+// inserted.
 func (c *Client[TTx]) InsertManyFastTx(ctx context.Context, tx TTx, params []InsertManyParams) (int, error) {
 	exec := c.driver.UnwrapExecutor(tx)
 	return c.insertManyFast(ctx, exec, params)
@@ -1603,7 +1782,10 @@ func (c *Client[TTx]) insertManyFast(ctx context.Context, tx riverdriver.Executo
 	}
 
 	results, err := c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
-		count, err := tx.JobInsertFastManyNoReturning(ctx, insertParams)
+		count, err := tx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+			Jobs:   insertParams,
+			Schema: c.config.schema,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1645,8 +1827,9 @@ func (c *Client[TTx]) maybeNotifyInsertForQueues(ctx context.Context, tx riverdr
 	}
 
 	err := tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
-		Topic:   string(notifier.NotificationTopicInsert),
 		Payload: payloads,
+		Schema:  c.config.schema,
+		Topic:   string(notifier.NotificationTopicInsert),
 	})
 	if err != nil {
 		c.baseService.Logger.ErrorContext(
@@ -1669,13 +1852,14 @@ func (c *Client[TTx]) notifyQueuePauseOrResume(ctx context.Context, tx riverdriv
 		slog.String("opts", fmt.Sprintf("%+v", opts)),
 	)
 
-	payload, err := json.Marshal(jobControlPayload{Action: action, Queue: queue})
+	payload, err := json.Marshal(controlEventPayload{Action: action, Queue: queue})
 	if err != nil {
 		return err
 	}
 
 	err = tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
 		Payload: []string{string(payload)},
+		Schema:  c.config.schema,
 		Topic:   string(notifier.NotificationTopicControl),
 	})
 	if err != nil {
@@ -1690,11 +1874,11 @@ func (c *Client[TTx]) notifyQueuePauseOrResume(ctx context.Context, tx riverdriv
 }
 
 // Validates job args prior to insertion. Currently, verifies that a worker to
-// handle the kind is registered in the configured workers bundle. An
-// insert-only client doesn't require a workers bundle be configured though, so
-// no validation occurs if one wasn't.
+// handle the kind is registered in the configured workers bundle.
+// This validation is skipped if the client is configured as an insert-only (with no workers)
+// or if the client is configured to skip unknown job kinds.
 func (c *Client[TTx]) validateJobArgs(args JobArgs) error {
-	if c.config.Workers == nil {
+	if c.config.Workers == nil || c.config.SkipUnknownJobCheck {
 		return nil
 	}
 
@@ -1706,21 +1890,25 @@ func (c *Client[TTx]) validateJobArgs(args JobArgs) error {
 }
 
 func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) *producer {
-	producer := newProducer(&c.baseService.Archetype, c.driver.GetExecutor(), &producerConfig{
-		ClientID:           c.config.ID,
-		Completer:          c.completer,
-		ErrorHandler:       c.config.ErrorHandler,
-		FetchCooldown:      c.config.FetchCooldown,
-		FetchPollInterval:  c.config.FetchPollInterval,
-		GlobalMiddleware:   c.config.WorkerMiddleware,
-		JobTimeout:         c.config.JobTimeout,
-		MaxWorkers:         queueConfig.MaxWorkers,
-		Notifier:           c.notifier,
-		Queue:              queueName,
-		QueueEventCallback: c.subscriptionManager.distributeQueueEvent,
-		RetryPolicy:        c.config.RetryPolicy,
-		SchedulerInterval:  c.config.schedulerInterval,
-		Workers:            c.config.Workers,
+	producer := newProducer(&c.baseService.Archetype, c.driver.GetExecutor(), c.pilot, &producerConfig{
+		ClientID:                     c.config.ID,
+		Completer:                    c.completer,
+		ErrorHandler:                 c.config.ErrorHandler,
+		FetchCooldown:                c.config.FetchCooldown,
+		FetchPollInterval:            c.config.FetchPollInterval,
+		HookLookupByJob:              c.hookLookupByJob,
+		HookLookupGlobal:             c.hookLookupGlobal,
+		JobTimeout:                   c.config.JobTimeout,
+		MaxWorkers:                   queueConfig.MaxWorkers,
+		MiddlewareLookupGlobal:       c.middlewareLookupGlobal,
+		Notifier:                     c.notifier,
+		Queue:                        queueName,
+		QueueEventCallback:           c.subscriptionManager.distributeQueueEvent,
+		RetryPolicy:                  c.config.RetryPolicy,
+		SchedulerInterval:            c.config.schedulerInterval,
+		Schema:                       c.config.schema,
+		StaleProducerRetentionPeriod: 5 * time.Minute,
+		Workers:                      c.config.Workers,
 	})
 	c.producersByQueueName[queueName] = producer
 	return producer
@@ -1846,7 +2034,10 @@ func (c *Client[TTx]) Queues() *QueueBundle { return c.queues }
 // The provided context is used for the underlying Postgres query and can be
 // used to cancel the operation or apply a timeout.
 func (c *Client[TTx]) QueueGet(ctx context.Context, name string) (*rivertype.Queue, error) {
-	return c.driver.GetExecutor().QueueGet(ctx, name)
+	return c.driver.GetExecutor().QueueGet(ctx, &riverdriver.QueueGetParams{
+		Name:   name,
+		Schema: c.config.schema,
+	})
 }
 
 // QueueGetTx returns the queue with the given name. If the queue has not recently
@@ -1855,7 +2046,10 @@ func (c *Client[TTx]) QueueGet(ctx context.Context, name string) (*rivertype.Que
 // The provided context is used for the underlying Postgres query and can be
 // used to cancel the operation or apply a timeout.
 func (c *Client[TTx]) QueueGetTx(ctx context.Context, tx TTx, name string) (*rivertype.Queue, error) {
-	return c.driver.UnwrapExecutor(tx).QueueGet(ctx, name)
+	return c.driver.UnwrapExecutor(tx).QueueGet(ctx, &riverdriver.QueueGetParams{
+		Name:   name,
+		Schema: c.config.schema,
+	})
 }
 
 // QueueListResult is the result of a job list operation. It contains a list of
@@ -1881,7 +2075,10 @@ func (c *Client[TTx]) QueueList(ctx context.Context, params *QueueListParams) (*
 		params = NewQueueListParams()
 	}
 
-	queues, err := c.driver.GetExecutor().QueueList(ctx, int(params.paginationCount))
+	queues, err := c.driver.GetExecutor().QueueList(ctx, &riverdriver.QueueListParams{
+		Limit:  int(params.paginationCount),
+		Schema: c.config.schema,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1905,7 +2102,10 @@ func (c *Client[TTx]) QueueListTx(ctx context.Context, tx TTx, params *QueueList
 		params = NewQueueListParams()
 	}
 
-	queues, err := c.driver.UnwrapExecutor(tx).QueueList(ctx, int(params.paginationCount))
+	queues, err := c.driver.UnwrapExecutor(tx).QueueList(ctx, &riverdriver.QueueListParams{
+		Limit:  int(params.paginationCount),
+		Schema: c.config.schema,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1931,7 +2131,10 @@ func (c *Client[TTx]) QueuePause(ctx context.Context, name string, opts *QueuePa
 	}
 	defer tx.Rollback(ctx)
 
-	if err := tx.QueuePause(ctx, name); err != nil {
+	if err := tx.QueuePause(ctx, &riverdriver.QueuePauseParams{
+		Name:   name,
+		Schema: c.config.schema,
+	}); err != nil {
 		return err
 	}
 
@@ -1956,7 +2159,10 @@ func (c *Client[TTx]) QueuePause(ctx context.Context, name string, opts *QueuePa
 func (c *Client[TTx]) QueuePauseTx(ctx context.Context, tx TTx, name string, opts *QueuePauseOpts) error {
 	executorTx := c.driver.UnwrapExecutor(tx)
 
-	if err := executorTx.QueuePause(ctx, name); err != nil {
+	if err := executorTx.QueuePause(ctx, &riverdriver.QueuePauseParams{
+		Name:   name,
+		Schema: c.config.schema,
+	}); err != nil {
 		return err
 	}
 
@@ -1986,7 +2192,10 @@ func (c *Client[TTx]) QueueResume(ctx context.Context, name string, opts *QueueP
 	}
 	defer tx.Rollback(ctx)
 
-	if err := tx.QueueResume(ctx, name); err != nil {
+	if err := tx.QueueResume(ctx, &riverdriver.QueueResumeParams{
+		Name:   name,
+		Schema: c.config.schema,
+	}); err != nil {
 		return err
 	}
 
@@ -2012,7 +2221,10 @@ func (c *Client[TTx]) QueueResume(ctx context.Context, name string, opts *QueueP
 func (c *Client[TTx]) QueueResumeTx(ctx context.Context, tx TTx, name string, opts *QueuePauseOpts) error {
 	executorTx := c.driver.UnwrapExecutor(tx)
 
-	if err := executorTx.QueueResume(ctx, name); err != nil {
+	if err := executorTx.QueueResume(ctx, &riverdriver.QueueResumeParams{
+		Name:   name,
+		Schema: c.config.schema,
+	}); err != nil {
 		return err
 	}
 
@@ -2023,13 +2235,84 @@ func (c *Client[TTx]) QueueResumeTx(ctx context.Context, tx TTx, name string, op
 	return nil
 }
 
+// QueueUpdateParams are the parameters for a QueueUpdate operation.
+type QueueUpdateParams struct {
+	// Metadata is the new metadata for the queue. If nil or empty, the metadata
+	// will not be changed.
+	Metadata []byte
+}
+
+// QueueUpdate updates a queue's settings in the database. These settings
+// override the settings in the client (if applied).
+func (c *Client[TTx]) QueueUpdate(ctx context.Context, name string, params *QueueUpdateParams) (*rivertype.Queue, error) {
+	tx, err := c.driver.GetExecutor().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	queue, err := c.queueUpdate(ctx, tx, name, params)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return queue, nil
+}
+
+// QueueUpdateTx updates a queue's settings in the database. These settings
+// override the settings in the client (if applied).
+func (c *Client[TTx]) QueueUpdateTx(ctx context.Context, tx TTx, name string, params *QueueUpdateParams) (*rivertype.Queue, error) {
+	executorTx := c.driver.UnwrapExecutor(tx)
+
+	return c.queueUpdate(ctx, executorTx, name, params)
+}
+
+func (c *Client[TTx]) queueUpdate(ctx context.Context, executorTx riverdriver.ExecutorTx, name string, params *QueueUpdateParams) (*rivertype.Queue, error) {
+	updateMetadata := len(params.Metadata) > 0
+
+	queue, err := executorTx.QueueUpdate(ctx, &riverdriver.QueueUpdateParams{
+		Metadata:         params.Metadata,
+		MetadataDoUpdate: updateMetadata,
+		Name:             name,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if updateMetadata {
+		payload, err := json.Marshal(controlEventPayload{
+			Action:   controlActionMetadataChanged,
+			Metadata: params.Metadata,
+			Queue:    queue.Name,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if err := executorTx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
+			Payload: []string{string(payload)},
+			Schema:  c.config.schema,
+			Topic:   string(notifier.NotificationTopicControl),
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	return queue, nil
+}
+
 // QueueBundle is a bundle for adding additional queues. It's made accessible
 // through Client.Queues.
 type QueueBundle struct {
 	// Function that adds a producer to the associated client.
 	addProducer func(queueName string, queueConfig QueueConfig) *producer
 
-	removeProducer func(queueName string)
+	removeProducer        func(queueName string)
+	clientWillExecuteJobs bool
 
 	fetchCtx context.Context //nolint:containedctx
 
@@ -2044,7 +2327,14 @@ type QueueBundle struct {
 // Add adds a new queue to the client. If the client is already started, a
 // producer for the queue is started. Context is inherited from the one given to
 // Client.Start.
+//
+// TODO: there is no way for this to work at runtime using a separate pro queue
+// config, unless we put pro configs like concurrency within QueueConfig.
 func (b *QueueBundle) Add(queueName string, queueConfig QueueConfig) error {
+	if !b.clientWillExecuteJobs {
+		return errors.New("client is not configured to execute jobs, cannot add queue")
+	}
+
 	if err := queueConfig.validate(queueName); err != nil {
 		return err
 	}

@@ -82,7 +82,10 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		finalInsertParams := sliceutil.Map(insertParams, func(params *rivertype.JobInsertParams) *riverdriver.JobInsertFastParams {
 			return (*riverdriver.JobInsertFastParams)(params)
 		})
-		results, err := tx.JobInsertFastMany(ctx, finalInsertParams)
+		results, err := tx.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{
+			Jobs:   finalInsertParams,
+			Schema: "",
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -109,12 +112,15 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		return svc, bundle
 	}
 
-	requireNJobs := func(t *testing.T, exec riverdriver.Executor, kind string, n int) []*rivertype.JobRow {
+	requireNJobs := func(t *testing.T, exec riverdriver.Executor, kind string, expectedNumJobs int) []*rivertype.JobRow {
 		t.Helper()
 
-		jobs, err := exec.JobGetByKindMany(ctx, []string{kind})
+		jobs, err := exec.JobGetByKindMany(ctx, &riverdriver.JobGetByKindManyParams{
+			Kind:   []string{kind},
+			Schema: "",
+		})
 		require.NoError(t, err)
-		require.Len(t, jobs, n, fmt.Sprintf("Expected to find exactly %d job(s) of kind: %s, but found %d", n, kind, len(jobs)))
+		require.Len(t, jobs, expectedNumJobs, "Expected to find exactly %d job(s) of kind: %s, but found %d", expectedNumJobs, kind, len(jobs))
 
 		return jobs
 	}
@@ -171,6 +177,44 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 		svc.TestSignals.InsertedJobs.WaitOrTimeout()
 		requireNJobs(t, bundle.exec, "periodic_job_500ms", 3)
 		requireNJobs(t, bundle.exec, "periodic_job_1500ms", 1)
+	})
+
+	t.Run("SetsPeriodicMetadataAttribute", func(t *testing.T) {
+		t.Parallel()
+
+		svc, bundle := setup(t)
+
+		jobConstructorWithMetadata := func(name string, metadata []byte) func() (*rivertype.JobInsertParams, error) {
+			return func() (*rivertype.JobInsertParams, error) {
+				params, err := jobConstructorFunc(name, false)()
+				if err != nil {
+					return nil, err
+				}
+				params.Metadata = metadata
+				return params, nil
+			}
+		}
+
+		svc.AddMany([]*PeriodicJob{
+			{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorWithMetadata("p_md_nil", nil)},
+			{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorWithMetadata("p_md_empty_string", []byte(""))},
+			{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorWithMetadata("p_md_empty_obj", []byte("{}"))},
+			{ScheduleFunc: periodicIntervalSchedule(500 * time.Millisecond), ConstructorFunc: jobConstructorWithMetadata("p_md_existing", []byte(`{"key": "value"}`))},
+		})
+
+		startService(t, svc)
+
+		svc.TestSignals.InsertedJobs.WaitOrTimeout()
+
+		assertMetadata := func(name string, expected string) {
+			job := requireNJobs(t, bundle.exec, name, 1)[0]
+			require.JSONEq(t, expected, string(job.Metadata))
+		}
+
+		assertMetadata("p_md_nil", `{"periodic": true}`)
+		assertMetadata("p_md_empty_string", `{"periodic": true}`)
+		assertMetadata("p_md_empty_obj", `{"periodic": true}`)
+		assertMetadata("p_md_existing", `{"key": "value", "periodic": true}`)
 	})
 
 	t.Run("SetsScheduledAtAccordingToExpectedNextRunAt", func(t *testing.T) {
@@ -346,7 +390,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 
 		svc.TestSignals.EnteredLoop.WaitOrTimeout()
 
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			svc.TestSignals.InsertedJobs.WaitOrTimeout()
 		}
 	})
@@ -497,7 +541,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 			time.Sleep(time.Duration(randutil.IntBetween(1, 5)) * time.Millisecond)
 		}
 
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			wg.Add(1)
 
 			jobBaseName := fmt.Sprintf("periodic_job_1ms_%02d", i)
@@ -505,7 +549,7 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 			go func() {
 				defer wg.Done()
 
-				for j := 0; j < 50; j++ {
+				for range 50 {
 					handle := svc.Add(&PeriodicJob{ScheduleFunc: periodicIntervalSchedule(time.Millisecond), ConstructorFunc: jobConstructorFunc(jobBaseName, false)})
 					randomSleep()
 

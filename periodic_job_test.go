@@ -11,6 +11,23 @@ import (
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 )
 
+func TestNeverSchedule(t *testing.T) {
+	t.Parallel()
+
+	t.Run("NextReturnsMaximumTime", func(t *testing.T) {
+		t.Parallel()
+
+		schedule := NeverSchedule()
+		now := time.Now()
+		next := schedule.Next(now)
+		require.Equal(t, time.Unix(1<<63-62135596801, 999999999), next)
+		require.False(t, next.Before(now))
+		// use an arbitrary duration to check that
+		// the next schedule is far in the future
+		require.Greater(t, next.Year()-now.Year(), 1000)
+	})
+}
+
 func TestPeriodicJobBundle(t *testing.T) {
 	t.Parallel()
 

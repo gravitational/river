@@ -4,7 +4,6 @@ package testfactory
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -21,13 +20,14 @@ import (
 type JobOpts struct {
 	Attempt      *int
 	AttemptedAt  *time.Time
+	AttemptedBy  []string
 	CreatedAt    *time.Time
 	EncodedArgs  []byte
 	Errors       [][]byte
 	FinalizedAt  *time.Time
 	Kind         *string
 	MaxAttempts  *int
-	Metadata     json.RawMessage
+	Metadata     []byte
 	Priority     *int
 	Queue        *string
 	ScheduledAt  *time.Time
@@ -45,7 +45,7 @@ func Job(ctx context.Context, tb testing.TB, exec riverdriver.Executor, opts *Jo
 	return job
 }
 
-func Job_Build(tb testing.TB, opts *JobOpts) *riverdriver.JobInsertFullParams { //nolint:stylecheck
+func Job_Build(tb testing.TB, opts *JobOpts) *riverdriver.JobInsertFullParams {
 	tb.Helper()
 
 	encodedArgs := opts.EncodedArgs
@@ -73,6 +73,7 @@ func Job_Build(tb testing.TB, opts *JobOpts) *riverdriver.JobInsertFullParams { 
 	return &riverdriver.JobInsertFullParams{
 		Attempt:      ptrutil.ValOrDefault(opts.Attempt, 0),
 		AttemptedAt:  opts.AttemptedAt,
+		AttemptedBy:  opts.AttemptedBy,
 		CreatedAt:    opts.CreatedAt,
 		EncodedArgs:  encodedArgs,
 		Errors:       opts.Errors,
@@ -117,10 +118,11 @@ type MigrationOpts struct {
 func Migration(ctx context.Context, tb testing.TB, exec riverdriver.Executor, opts *MigrationOpts) *riverdriver.Migration {
 	tb.Helper()
 
-	migration, err := exec.MigrationInsertMany(ctx,
-		ptrutil.ValOrDefault(opts.Line, riverdriver.MigrationLineMain),
-		[]int{ptrutil.ValOrDefaultFunc(opts.Version, nextSeq)},
-	)
+	migration, err := exec.MigrationInsertMany(ctx, &riverdriver.MigrationInsertManyParams{
+		Line:     ptrutil.ValOrDefault(opts.Line, riverdriver.MigrationLineMain),
+		Schema:   "",
+		Versions: []int{ptrutil.ValOrDefaultFunc(opts.Version, nextSeq)},
+	})
 	require.NoError(tb, err)
 	return migration[0]
 }

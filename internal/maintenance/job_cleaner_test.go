@@ -105,32 +105,32 @@ func TestJobCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		var err error
-		_, err = bundle.exec.JobGetByID(ctx, job1.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: cleaner.Config.Schema})
 		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
-		_, err = bundle.exec.JobGetByID(ctx, job2.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: cleaner.Config.Schema})
 		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
-		_, err = bundle.exec.JobGetByID(ctx, job3.ID)
-		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
-
-		_, err = bundle.exec.JobGetByID(ctx, cancelledJob1.ID)
-		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, cancelledJob2.ID)
-		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, cancelledJob3.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job3.ID, Schema: cleaner.Config.Schema})
 		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
 
-		_, err = bundle.exec.JobGetByID(ctx, completedJob1.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: cancelledJob1.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, completedJob2.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: cancelledJob2.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, completedJob3.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: cancelledJob3.ID, Schema: cleaner.Config.Schema})
 		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
 
-		_, err = bundle.exec.JobGetByID(ctx, discardedJob1.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: completedJob1.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, discardedJob2.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: completedJob2.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, discardedJob3.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: completedJob3.ID, Schema: cleaner.Config.Schema})
+		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
+
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: discardedJob1.ID, Schema: cleaner.Config.Schema})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: discardedJob2.ID, Schema: cleaner.Config.Schema})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: discardedJob3.ID, Schema: cleaner.Config.Schema})
 		require.NotErrorIs(t, err, rivertype.ErrNotFound) // still there
 	})
 
@@ -146,7 +146,7 @@ func TestJobCleaner(t *testing.T) {
 
 		jobs := make([]*rivertype.JobRow, numJobs)
 
-		for i := 0; i < numJobs; i++ {
+		for i := range numJobs {
 			job := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateCompleted), FinalizedAt: ptrutil.Ptr(bundle.completedDeleteHorizon.Add(-1 * time.Hour))})
 			jobs[i] = job
 		}
@@ -158,7 +158,7 @@ func TestJobCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		for _, job := range jobs {
-			_, err := bundle.exec.JobGetByID(ctx, job.ID)
+			_, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: cleaner.Config.Schema})
 			require.ErrorIs(t, err, rivertype.ErrNotFound)
 		}
 	})
@@ -172,7 +172,7 @@ func TestJobCleaner(t *testing.T) {
 		require.NoError(t, cleaner.Start(ctx))
 
 		// This should trigger ~immediately every time:
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			t.Logf("Iteration %d", i)
 			cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 		}
@@ -228,9 +228,9 @@ func TestJobCleaner(t *testing.T) {
 		cleaner.TestSignals.DeletedBatch.WaitOrTimeout()
 
 		var err error
-		_, err = bundle.exec.JobGetByID(ctx, job1.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
-		_, err = bundle.exec.JobGetByID(ctx, job2.ID)
+		_, err = bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID, Schema: cleaner.Config.Schema})
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
 	})
 }

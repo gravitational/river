@@ -9,6 +9,7 @@ import (
 
 	"github.com/riverqueue/river/internal/maintenance"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 )
 
 func TestNeverSchedule(t *testing.T) {
@@ -36,13 +37,14 @@ func TestPeriodicJobBundle(t *testing.T) {
 	setup := func(t *testing.T) (*PeriodicJobBundle, *testBundle) { //nolint:unparam
 		t.Helper()
 
-		periodicJobEnqueuer := maintenance.NewPeriodicJobEnqueuer(
+		periodicJobEnqueuer, err := maintenance.NewPeriodicJobEnqueuer(
 			riversharedtest.BaseServiceArchetype(t),
 			&maintenance.PeriodicJobEnqueuerConfig{},
 			nil,
 		)
+		require.NoError(t, err)
 
-		return newPeriodicJobBundle(newTestConfig(t, nil), periodicJobEnqueuer), &testBundle{}
+		return newPeriodicJobBundle(newTestConfig(t, ""), periodicJobEnqueuer), &testBundle{}
 	}
 
 	t.Run("ConstructorFuncGeneratesNewArgsOnEachCall", func(t *testing.T) {
@@ -51,7 +53,8 @@ func TestPeriodicJobBundle(t *testing.T) {
 		periodicJobBundle, _ := setup(t)
 
 		type TestJobArgs struct {
-			JobArgsReflectKind[TestJobArgs]
+			testutil.JobArgsReflectKind[TestJobArgs]
+
 			JobNum int `json:"job_num"`
 		}
 
@@ -66,7 +69,7 @@ func TestPeriodicJobBundle(t *testing.T) {
 			nil,
 		)
 
-		internalPeriodicJob := periodicJobBundle.toInternal(periodicJob)
+		internalPeriodicJob := periodicJobBundle.mapper.toInternal(periodicJob)
 
 		insertParams1, err := internalPeriodicJob.ConstructorFunc()
 		require.NoError(t, err)
@@ -91,10 +94,52 @@ func TestPeriodicJobBundle(t *testing.T) {
 			nil,
 		)
 
-		internalPeriodicJob := periodicJobBundle.toInternal(periodicJob)
+		internalPeriodicJob := periodicJobBundle.mapper.toInternal(periodicJob)
 
 		_, err := internalPeriodicJob.ConstructorFunc()
 		require.ErrorIs(t, err, maintenance.ErrNoJobToInsert)
+	})
+
+	t.Run("AddError", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		periodicJob := NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		)
+
+		periodicJobBundle.Add(periodicJob)
+
+		require.PanicsWithError(t, "periodic job with ID already registered: periodic_job_id", func() {
+			periodicJobBundle.Add(periodicJob)
+		})
+
+		_, err := periodicJobBundle.AddSafely(periodicJob)
+		require.EqualError(t, err, "periodic job with ID already registered: periodic_job_id")
+	})
+
+	t.Run("AddManyError", func(t *testing.T) {
+		t.Parallel()
+
+		periodicJobBundle, _ := setup(t)
+
+		periodicJob := NewPeriodicJob(
+			PeriodicInterval(15*time.Minute),
+			func() (JobArgs, *InsertOpts) { return nil, nil },
+			&PeriodicJobOpts{ID: "periodic_job_id"},
+		)
+
+		periodicJobBundle.Add(periodicJob)
+
+		require.PanicsWithError(t, "periodic job with ID already registered: periodic_job_id", func() {
+			periodicJobBundle.AddMany([]*PeriodicJob{periodicJob})
+		})
+
+		_, err := periodicJobBundle.AddManySafely([]*PeriodicJob{periodicJob})
+		require.EqualError(t, err, "periodic job with ID already registered: periodic_job_id")
 	})
 }
 

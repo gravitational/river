@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/uniquestates"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -28,7 +29,7 @@ func TestUniqueKey(t *testing.T) {
 	// Fixed timestamp for consistency across tests:
 	now := time.Now().UTC()
 	stubSvc := &riversharedtest.TimeStub{}
-	stubSvc.StubNowUTC(now)
+	stubSvc.StubNow(now)
 
 	tests := []struct {
 		name                   string
@@ -42,6 +43,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type EmailJobArgs struct {
 					JobArgsStaticKind
+
 					Recipient   string `json:"recipient"    river:"unique"`
 					Subject     string `json:"subject"      river:"unique"`
 					Body        string `json:"body"`
@@ -65,6 +67,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type SMSJobArgs struct {
 					JobArgsStaticKind
+
 					PhoneNumber string `json:"phone_number"      river:"unique"`
 					Message     string `json:"message,omitempty" river:"unique"`
 					TemplateID  int    `json:"template_id"`
@@ -84,6 +87,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type EmailJobArgs struct {
 					JobArgsStaticKind
+
 					Recipient  string `river:"unique"`
 					Subject    string `river:"unique"`
 					TemplateID int
@@ -103,6 +107,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type EmailJobArgs struct {
 					JobArgsStaticKind
+
 					Recipient string `json:"recipient" river:"unique"`
 					Subject   string `json:"subject"   river:"unique"`
 					Body      string `json:"body"`
@@ -118,10 +123,213 @@ func TestUniqueKey(t *testing.T) {
 			expectedJSON: `&kind=worker_1&args={"recipient":"john@example.com","subject":"Another Test Email"}`,
 		},
 		{
+			name: "ByArgsWithSubstructNonPointer",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Addresses EmailAddresses `json:"addresses"`
+					Subject   string         `json:"subject"   river:"unique"`
+					Body      string         `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Addresses: EmailAddresses{
+						Recipient: "john@example.com",
+					},
+					Subject: "Another Test Email",
+					Body:    "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"addresses":{"recipient":"john@example.com"},"subject":"Another Test Email"}`,
+		},
+		{
+			name: "ByArgsWithSubstructPointer",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Addresses *EmailAddresses `json:"addresses"`
+					Subject   string          `json:"subject"   river:"unique"`
+					Body      string          `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Addresses: &EmailAddresses{
+						Recipient: "john@example.com",
+					},
+					Subject: "Another Test Email",
+					Body:    "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"addresses":{"recipient":"john@example.com"},"subject":"Another Test Email"}`,
+		},
+		{
+			name: "ByArgsWithEmbeddedSubstruct",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					EmailAddresses
+					JobArgsStaticKind
+
+					Subject string `json:"subject" river:"unique"`
+					Body    string `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					EmailAddresses: EmailAddresses{
+						Recipient: "john@example.com",
+					},
+					Subject: "Another Test Email",
+					Body:    "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"recipient":"john@example.com","subject":"Another Test Email"}`,
+		},
+		{
+			name: "ByArgsWithEmbeddedNonStruct",
+			argsFunc: func() rivertype.JobArgs {
+				type MyString string
+				type TaskJobArgs struct {
+					JobArgsStaticKind
+					MyString // anonymous non-struct field; needs to be a custom type because it has to be capitalized to be exported
+				}
+				return TaskJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_7"},
+					MyString:          "my_string_in_anonymous_field",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_7&args={"MyString":"my_string_in_anonymous_field"}`,
+		},
+		{
+			name: "ByArgsWithSubstructTagged",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Addresses EmailAddresses `json:"addresses" river:"unique"`
+					Subject   string         `json:"subject"   river:"unique"`
+					Body      string         `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Addresses: EmailAddresses{
+						Recipient: "john@example.com",
+					},
+					Subject: "Another Test Email",
+					Body:    "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"addresses":{"recipient":"john@example.com"},"subject":"Another Test Email"}`,
+		},
+		{
+			name: "ByArgsWithAllSubstructUntagged",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Addresses *EmailAddresses `json:"addresses" river:"unique"`
+					Subject   string          `json:"subject"   river:"unique"`
+					Body      string          `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Addresses: &EmailAddresses{
+						Recipient: "john@example.com",
+					},
+					Subject: "Another Test Email",
+					Body:    "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"addresses":{"recipient":"john@example.com","bcc":""},"subject":"Another Test Email"}`,
+		},
+		{
+			name: "ByArgsWithMultiLevelSubstructPointer",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+				}
+				type EmailHeaders struct {
+					Addresses *EmailAddresses `json:"addresses" river:"unique"`
+					Subject   string          `json:"subject"   river:"unique"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Headers *EmailHeaders `json:"headers" river:"unique"`
+					Body    string        `json:"body"`
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Headers: &EmailHeaders{
+						Addresses: &EmailAddresses{
+							Recipient: "john@example.com",
+						},
+						Subject: "Another Test Email",
+					},
+					Body: "This is another test email.",
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"headers":{"addresses":{"recipient":"john@example.com"},"subject":"Another Test Email"}}`,
+		},
+		{
+			name: "ByArgsUnexportedSkipped",
+			argsFunc: func() rivertype.JobArgs {
+				type EmailAddresses struct {
+					Recipient string `json:"recipient" river:"unique"`
+					BCC       string `json:"bcc"`
+				}
+				type EmailJobArgs struct {
+					JobArgsStaticKind
+
+					Subject   string `json:"subject" river:"unique"`
+					Body      string `json:"body"`
+					addresses EmailAddresses
+				}
+				return &EmailJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_1"},
+					Subject:           "Another Test Email",
+					Body:              "This is another test email.",
+					addresses: EmailAddresses{
+						Recipient: "john@example.com",
+					},
+				}
+			},
+			uniqueOpts:   UniqueOpts{ByArgs: true},
+			expectedJSON: `&kind=worker_1&args={"subject":"Another Test Email"}`,
+		},
+		{
 			name: "ByArgsWithNoUniqueFields",
 			argsFunc: func() rivertype.JobArgs {
 				type GenericJobArgs struct {
 					JobArgsStaticKind
+
 					Description string `json:"description"`
 					Count       int    `json:"count"`
 					foo         string // won't be marshaled in JSON
@@ -153,10 +361,44 @@ func TestUniqueKey(t *testing.T) {
 			expectedJSON: `&kind=worker_1&args={}`,
 		},
 		{
+			name: "ByArgsRecursiveType",
+			argsFunc: func() rivertype.JobArgs {
+				type RecursiveType struct {
+					NotUnique string         `river:"-"`
+					Recursive *RecursiveType `river:"unique"` // inner recursive type ignored by River
+					String    string         `river:"unique"`
+				}
+				type TaskJobArgs struct {
+					JobArgsStaticKind
+
+					Recursive RecursiveType `river:"unique"`
+				}
+				return TaskJobArgs{
+					JobArgsStaticKind: JobArgsStaticKind{kind: "worker_7"},
+					Recursive: RecursiveType{
+						Recursive: &RecursiveType{
+							String: "level2",
+						},
+						String: "level1",
+					},
+				}
+			},
+			uniqueOpts: UniqueOpts{ByArgs: true},
+
+			// Notably, "NotUnique" shows up here inside the inner recursive
+			// type because when River saw the recursive typed markd with
+			// `unique` again, it just gave up and returned the entire the
+			// entire key which is then extracted by gjson. The top-level type
+			// also has a "NotUnique", but that's not returned because River was
+			// processing this type for the first time.
+			expectedJSON: `&kind=worker_7&args={"Recursive":{"Recursive":{"NotUnique":"","Recursive":null,"String":"level2"},"String":"level1"}}`,
+		},
+		{
 			name: "CustomByStateWithPeriod",
 			argsFunc: func() rivertype.JobArgs {
 				type TaskJobArgs struct {
 					JobArgsStaticKind
+
 					TaskID string
 				}
 				return TaskJobArgs{
@@ -188,6 +430,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type TaskJobArgs struct {
 					JobArgsStaticKind
+
 					TaskID string `json:"task_id"`
 				}
 				return TaskJobArgs{
@@ -203,6 +446,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type TaskJobArgs struct {
 					JobArgsStaticKind
+
 					TaskID string `json:"task_id"`
 				}
 				return TaskJobArgs{
@@ -218,6 +462,7 @@ func TestUniqueKey(t *testing.T) {
 			argsFunc: func() rivertype.JobArgs {
 				type TaskJobArgs struct {
 					JobArgsStaticKind
+
 					TaskID string `json:"task_id"`
 				}
 				return TaskJobArgs{
@@ -254,7 +499,7 @@ func TestUniqueKey(t *testing.T) {
 				ScheduledAt:  &now,
 				State:        "Pending",
 				Tags:         []string{"notification", "email"},
-				UniqueStates: UniqueStatesToBitmask(states),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(states),
 			}
 
 			if tt.modifyInsertParamsFunc != nil {
@@ -309,25 +554,11 @@ func TestUniqueOptsStateBitmask(t *testing.T) {
 	t.Parallel()
 
 	emptyOpts := &UniqueOpts{}
-	require.Equal(t, UniqueStatesToBitmask(uniqueOptsByStateDefault), emptyOpts.StateBitmask(), "Empty unique options should have default bitmask")
+	require.Equal(t, uniquestates.UniqueStatesToBitmask(uniqueOptsByStateDefault), emptyOpts.StateBitmask(), "Empty unique options should have default bitmask")
 
 	otherStates := []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted}
 	nonEmptyOpts := &UniqueOpts{
 		ByState: otherStates,
 	}
-	require.Equal(t, UniqueStatesToBitmask([]rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted}), nonEmptyOpts.StateBitmask(), "Non-empty unique options should have correct bitmask")
-}
-
-func TestUniqueStatesToBitmask(t *testing.T) {
-	t.Parallel()
-
-	bitmask := UniqueStatesToBitmask(uniqueOptsByStateDefault)
-	require.Equal(t, byte(0b11110101), bitmask, "Default unique states should be all set except cancelled and discarded")
-
-	for state, position := range jobStateBitPositions {
-		bitmask = UniqueStatesToBitmask([]rivertype.JobState{state})
-		// Bit shifting uses postgres bit numbering with MSB on the right, so we
-		// need to flip the position when shifting manually:
-		require.Equal(t, byte(1<<(7-position)), bitmask, "Bitmask should be set for single state %s", state)
-	}
+	require.Equal(t, uniquestates.UniqueStatesToBitmask([]rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCompleted}), nonEmptyOpts.StateBitmask(), "Non-empty unique options should have correct bitmask")
 }

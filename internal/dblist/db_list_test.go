@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/testfactory"
@@ -23,14 +23,16 @@ func TestJobListNoJobs(t *testing.T) {
 	ctx := context.Background()
 
 	type testBundle struct {
-		exec riverdriver.Executor
+		driver *riverpgxv5.Driver
+		exec   riverdriver.Executor
 	}
 
 	setup := func() *testBundle {
 		driver := riverpgxv5.New(nil)
 
 		return &testBundle{
-			exec: driver.UnwrapExecutor(riverinternaltest.TestTx(ctx, t)),
+			driver: driver,
+			exec:   driver.UnwrapExecutor(riverdbtest.TestTxPgx(ctx, t)),
 		}
 	}
 
@@ -39,11 +41,14 @@ func TestJobListNoJobs(t *testing.T) {
 
 		bundle := setup()
 
-		_, err := JobList(ctx, bundle.exec, &JobListParams{
+		listParams, err := JobMakeDriverParams(ctx, &JobListParams{
 			States:     []rivertype.JobState{rivertype.JobStateCompleted},
 			LimitCount: 1,
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
-		})
+		}, bundle.driver.SQLFragmentColumnIn)
+		require.NoError(t, err)
+
+		_, err = bundle.exec.JobList(ctx, listParams)
 		require.NoError(t, err)
 	})
 
@@ -52,13 +57,17 @@ func TestJobListNoJobs(t *testing.T) {
 
 		bundle := setup()
 
-		_, err := JobList(ctx, bundle.exec, &JobListParams{
-			Conditions: "queue = 'test' AND priority = 1 AND args->>'foo' = @foo",
-			NamedArgs:  pgx.NamedArgs{"foo": "bar"},
+		listParams, err := JobMakeDriverParams(ctx, &JobListParams{
 			States:     []rivertype.JobState{rivertype.JobStateCompleted},
 			LimitCount: 1,
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
-		})
+			Where: []WherePredicate{
+				{NamedArgs: map[string]any{"foo": "bar"}, SQL: "queue = 'test' AND priority = 1 AND args->>'foo' = @foo"},
+			},
+		}, bundle.driver.SQLFragmentColumnIn)
+		require.NoError(t, err)
+
+		_, err = bundle.exec.JobList(ctx, listParams)
 		require.NoError(t, err)
 	})
 }
@@ -80,15 +89,15 @@ func TestJobListWithJobs(t *testing.T) {
 
 		var (
 			driver = riverpgxv5.New(nil)
-			tx     = riverinternaltest.TestTx(ctx, t)
+			tx     = riverdbtest.TestTxPgx(ctx, t)
 			exec   = driver.UnwrapExecutor(tx)
 		)
 
-		job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Queue: ptrutil.Ptr("priority")})
-		job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{EncodedArgs: []byte(`{"job_num": 2}`)})
-		job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Metadata: []byte(`{"some_key": "some_value"}`)})
-		job4 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning)})
-		job5 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr("alternate_kind")})
+		job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Queue: ptrutil.Ptr("priority"), Priority: ptrutil.Ptr(1)})
+		job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{EncodedArgs: []byte(`{"job_num": 2}`), Priority: ptrutil.Ptr(2)})
+		job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Metadata: []byte(`{"some_key": "some_value"}`), Priority: ptrutil.Ptr(3)})
+		job4 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: ptrutil.Ptr(rivertype.JobStateRunning), Priority: ptrutil.Ptr(1)})
+		job5 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Kind: ptrutil.Ptr("alternate_kind"), Priority: ptrutil.Ptr(2)})
 
 		return &testBundle{
 			baselineTime: time.Now(),
@@ -102,17 +111,28 @@ func TestJobListWithJobs(t *testing.T) {
 
 	execTest := func(ctx context.Context, t *testing.T, bundle *testBundle, params *JobListParams, testFunc testListFunc) {
 		t.Helper()
+
+		listParams, err := JobMakeDriverParams(ctx, params, bundle.driver.SQLFragmentColumnIn)
+		require.NoError(t, err)
+
 		t.Logf("testing JobList in Executor")
-		jobs, err := JobList(ctx, bundle.exec, params)
-		testFunc(jobs, err)
+		{
+			jobs, err := bundle.exec.JobList(ctx, listParams)
+			require.NoError(t, err)
+			testFunc(jobs, err)
+		}
 
 		t.Logf("testing JobListTx")
-		// use a sub-transaction in case it's rolled back or errors:
-		tx, err := bundle.exec.Begin(ctx)
-		require.NoError(t, err)
-		defer tx.Rollback(ctx)
-		jobs, err = JobList(ctx, tx, params)
-		testFunc(jobs, err)
+		{
+			// use a sub-transaction in case it's rolled back or errors:
+			execTx, err := bundle.exec.Begin(ctx)
+			require.NoError(t, err)
+			defer execTx.Rollback(ctx)
+
+			jobs, err := execTx.JobList(ctx, listParams)
+			require.NoError(t, err)
+			testFunc(jobs, err)
+		}
 	}
 
 	t.Run("Minimal", func(t *testing.T) {
@@ -146,11 +166,12 @@ func TestJobListWithJobs(t *testing.T) {
 		bundle := setup(t)
 
 		params := &JobListParams{
-			Conditions: "jsonb_extract_path(args, VARIADIC @paths1::text[]) = @value1::jsonb",
 			LimitCount: 2,
-			NamedArgs:  map[string]any{"paths1": []string{"job_num"}, "value1": 2},
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
 			States:     []rivertype.JobState{rivertype.JobStateAvailable},
+			Where: []WherePredicate{
+				{NamedArgs: map[string]any{"paths1": []string{"job_num"}, "value1": 2}, SQL: "jsonb_extract_path(args, VARIADIC @paths1::text[]) = @value1::jsonb"},
+			},
 		}
 
 		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
@@ -162,17 +183,62 @@ func TestJobListWithJobs(t *testing.T) {
 		})
 	})
 
-	t.Run("ConditionsWithKinds", func(t *testing.T) {
+	t.Run("WhereWithIDs", func(t *testing.T) {
+		t.Parallel()
+		bundle := setup(t)
+		job1, job2, job3 := bundle.jobs[0], bundle.jobs[1], bundle.jobs[2]
+		params := &JobListParams{
+			IDs:        []int64{job1.ID},
+			LimitCount: 10,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
+		}
+		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
+			require.NoError(t, err)
+			require.Equal(t, []int64{job1.ID}, sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID }))
+		})
+		params = &JobListParams{
+			IDs:        []int64{job2.ID, job3.ID},
+			LimitCount: 10,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
+		}
+		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
+			require.NoError(t, err)
+			require.Equal(t, []int64{job2.ID, job3.ID}, sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID }))
+		})
+	})
+
+	t.Run("WhereWithIDsAndPriorities", func(t *testing.T) {
+		t.Parallel()
+		bundle := setup(t)
+		job1, job2, job3 := bundle.jobs[0], bundle.jobs[1], bundle.jobs[2]
+		params := &JobListParams{
+			IDs:        []int64{job1.ID, job2.ID, job3.ID},
+			Priorities: []int16{1},
+			LimitCount: 10,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
+		}
+		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
+			require.NoError(t, err)
+			// Only job1 is in the IDs list and has priority 1
+			expected := []int64{job1.ID}
+			actual := sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID })
+			require.Equal(t, expected, actual)
+		})
+	})
+
+	t.Run("WhereWithKinds", func(t *testing.T) {
 		t.Parallel()
 
 		bundle := setup(t)
 
 		params := &JobListParams{
-			Conditions: "finalized_at IS NULL",
 			LimitCount: 2,
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
 			Kinds:      []string{"alternate_kind"},
 			States:     []rivertype.JobState{rivertype.JobStateAvailable},
+			Where: []WherePredicate{
+				{SQL: "finalized_at IS NULL"},
+			},
 		}
 
 		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
@@ -184,17 +250,36 @@ func TestJobListWithJobs(t *testing.T) {
 		})
 	})
 
-	t.Run("ConditionsWithQueues", func(t *testing.T) {
+	t.Run("WhereWithPriorities", func(t *testing.T) {
+		t.Parallel()
+		bundle := setup(t)
+		_, job2, job3, _, job5 := bundle.jobs[0], bundle.jobs[1], bundle.jobs[2], bundle.jobs[3], bundle.jobs[4]
+		params := &JobListParams{
+			Priorities: []int16{2, 3},
+			LimitCount: 10,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderAsc}},
+		}
+		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
+			require.NoError(t, err)
+			expected := []int64{job2.ID, job3.ID, job5.ID}
+			actual := sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID })
+			require.Equal(t, expected, actual)
+		})
+	})
+
+	t.Run("WhereWithQueues", func(t *testing.T) {
 		t.Parallel()
 
 		bundle := setup(t)
 
 		params := &JobListParams{
-			Conditions: "finalized_at IS NULL",
 			LimitCount: 2,
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
 			Queues:     []string{"priority"},
 			States:     []rivertype.JobState{rivertype.JobStateAvailable},
+			Where: []WherePredicate{
+				{SQL: "finalized_at IS NULL"},
+			},
 		}
 
 		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
@@ -212,10 +297,11 @@ func TestJobListWithJobs(t *testing.T) {
 		bundle := setup(t)
 
 		params := &JobListParams{
-			Conditions: "metadata @> @metadata_filter::jsonb",
 			LimitCount: 2,
-			NamedArgs:  map[string]any{"metadata_filter": `{"some_key": "some_value"}`},
 			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
+			Where: []WherePredicate{
+				{NamedArgs: map[string]any{"metadata_filter": `{"some_key": "some_value"}`}, SQL: "metadata @> @metadata_filter::jsonb"},
+			},
 		}
 
 		execTest(ctx, t, bundle, params, func(jobs []*rivertype.JobRow, err error) {
@@ -225,5 +311,40 @@ func TestJobListWithJobs(t *testing.T) {
 			returnedIDs := sliceutil.Map(jobs, func(j *rivertype.JobRow) int64 { return j.ID })
 			require.Equal(t, []int64{job3.ID}, returnedIDs)
 		})
+	})
+
+	t.Run("NamedArgNotPresentInQueryError", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+
+		params := &JobListParams{
+			LimitCount: 2,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
+			Where: []WherePredicate{
+				{NamedArgs: map[string]any{"not_present": "foo"}, SQL: "1"},
+			},
+		}
+
+		_, err := JobMakeDriverParams(ctx, params, bundle.driver.SQLFragmentColumnIn)
+		require.EqualError(t, err, `expected "1" to contain named arg symbol @not_present`)
+	})
+
+	t.Run("DuplicateNamedArgError", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+
+		params := &JobListParams{
+			LimitCount: 2,
+			OrderBy:    []JobListOrderBy{{Expr: "id", Order: SortOrderDesc}},
+			Where: []WherePredicate{
+				{NamedArgs: map[string]any{"duplicate": "foo"}, SQL: "duplicate = @duplicate"},
+				{NamedArgs: map[string]any{"duplicate": "foo"}, SQL: "duplicate = @duplicate"},
+			},
+		}
+
+		_, err := JobMakeDriverParams(ctx, params, bundle.driver.SQLFragmentColumnIn)
+		require.EqualError(t, err, "named argument @duplicate already registered")
 	})
 }

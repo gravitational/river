@@ -1,6 +1,7 @@
 package sliceutil
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"testing"
@@ -8,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDefaultIfEmpty(t *testing.T) {
+func TestFirstNonEmpty(t *testing.T) {
 	t.Parallel()
 
 	result1 := FirstNonEmpty([]int{1, 2, 3}, []int{4, 5, 6})
@@ -88,4 +89,31 @@ func TestMap(t *testing.T) {
 	require.Len(t, result2, 4)
 	require.Equal(t, []string{"Hello", "Hello", "Hello", "Hello"}, result1)
 	require.Equal(t, []string{"1", "2", "3", "4"}, result2)
+}
+
+func TestMapError(t *testing.T) {
+	t.Parallel()
+
+	result1, err := MapError([]int64{1, 2, 3, 4}, func(x int64) (string, error) {
+		return strconv.FormatInt(x, 10), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"1", "2", "3", "4"}, result1)
+
+	_, err = MapError([]int64{1, 2, 3, 4}, func(x int64) (string, error) {
+		if x == 4 {
+			return "", errors.New("error on element 4")
+		}
+		return strconv.FormatInt(x, 10), nil
+	})
+	require.EqualError(t, err, "error on element 4")
+}
+
+func TestUniq(t *testing.T) {
+	t.Parallel()
+
+	result1 := Uniq([]int{1, 2, 2, 1})
+
+	require.Len(t, result1, 2)
+	require.Equal(t, []int{1, 2}, result1)
 }

@@ -11,12 +11,13 @@ import (
 	"github.com/riverqueue/river/internal/execution"
 	"github.com/riverqueue/river/internal/jobexecutor"
 	"github.com/riverqueue/river/internal/rivercommon"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/testfactory"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivertype"
 )
 
@@ -26,7 +27,7 @@ func TestJobCompleteTx(t *testing.T) {
 	ctx := context.Background()
 
 	type JobArgs struct {
-		JobArgsReflectKind[JobArgs]
+		testutil.JobArgsReflectKind[JobArgs]
 	}
 
 	type testBundle struct {
@@ -38,7 +39,7 @@ func TestJobCompleteTx(t *testing.T) {
 	setup := func(ctx context.Context, t *testing.T) (context.Context, *testBundle) {
 		t.Helper()
 
-		tx := riverinternaltest.TestTx(ctx, t)
+		tx := riverdbtest.TestTxPgx(ctx, t)
 		client, err := NewClient(riverpgxv5.New(nil), &Config{
 			Logger: riversharedtest.Logger(t),
 		})

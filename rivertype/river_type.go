@@ -181,7 +181,7 @@ const (
 	JobStateCompleted JobState = "completed"
 
 	// JobStateDiscarded is the state for jobs that have errored enough times
-	// that they're no longer eligible to be retried. Manual user invention
+	// that they're no longer eligible to be retried. Manual user intervention
 	// is required for them to be tried again.
 	//
 	// Discarded jobs are reaped by the job cleaner service after a configured
@@ -251,10 +251,14 @@ type AttemptError struct {
 
 	// Trace contains a stack trace from a job that panicked. The trace is
 	// produced by invoking `debug.Trace()`.
+	//
+	// In the case of a non-panic or an error produced as a stuck job was
+	// rescued, this value will be an empty string.
 	Trace string `json:"trace"`
 }
 
 type JobInsertParams struct {
+	ID           *int64
 	Args         JobArgs
 	CreatedAt    *time.Time
 	EncodedArgs  []byte
@@ -300,6 +304,7 @@ type JobInsertParams struct {
 // List of hook interfaces that may be implemented:
 // - HookInsertBegin
 // - HookWorkBegin
+// - HookWorkEnd
 //
 // More operation-specific interfaces may be added in future versions.
 type Hook interface {
@@ -314,7 +319,36 @@ type Hook interface {
 type HookInsertBegin interface {
 	Hook
 
+	// InsertBegin is invoked just before a job is inserted to the database.
 	InsertBegin(ctx context.Context, params *JobInsertParams) error
+}
+
+// HookPeriodicJobsStart is an interface to a hook that runs when the periodic
+// job enqueuer starts on a newly elected leader.
+type HookPeriodicJobsStart interface {
+	Hook
+
+	// Start is invoked when the periodic job enqueuer starts on a newly elected
+	// leader.
+	//
+	// Returning an error will cancel the periodic job enqueuer's start up
+	// routine. Be very careful with this because if the error is chronic, it
+	// will prevent any client from successfully starting as leader, thereby
+	// effectively disabling all maintenance services.
+	Start(ctx context.Context, params *HookPeriodicJobsStartParams) error
+}
+
+// HookPeriodicJobsStartParams are parameters for HookPeriodicJobsStart.
+type HookPeriodicJobsStartParams struct {
+	// DurableJobs contains a list of durable periodic job records that
+	// were found in the database. This includes durable jobs that have been
+	// recently active in an elected periodic job enqueuer, but may also contain
+	// jobs that've been previously removed, but for which their database record
+	// has not yet been reaped.
+	//
+	// This property will be empty unless durable jobs (a pro feature) are
+	// enabled.
+	DurableJobs []*DurablePeriodicJob
 }
 
 // HookWorkBegin is an interface to a hook that runs after a job has been locked
@@ -322,7 +356,48 @@ type HookInsertBegin interface {
 type HookWorkBegin interface {
 	Hook
 
+	// WorkBegin is invoked after a job has been locked and assigned to a
+	// particular executor for work and just before the job is actually worked.
+	//
+	// Returning an error from any HookWorkBegin hook will abort the job early
+	// such that it has an error set and doesn't work, with a retry scheduled
+	// according to its retry policy.
+	//
+	// This function doesn't return a context so any context set in WorkBegin is
+	// discarded after the function returns. If persistent context needs to be
+	// set, middleware should be used instead.
 	WorkBegin(ctx context.Context, job *JobRow) error
+}
+
+// HookWorkEnd is an interface to a hook that runs after a job has been worked.
+type HookWorkEnd interface {
+	Hook
+
+	// WorkEnd is invoked after a job has been worked with the error result of
+	// the worked job. It's invoked after any middleware has already run.
+	//
+	// WorkEnd may modify a returned work error or pass it through unchanged.
+	// Each returned error is passed through to the next hook and the final
+	// error result is returned from the job executor:
+	//
+	// 	err := e.WorkUnit.Work(ctx)
+	// 	for _, hook := range hooks {
+	// 		err = hook.(rivertype.HookWorkEnd).WorkEnd(ctx, e.JobRow, err)
+	// 	}
+	// 	return err
+	//
+	// If a hook does not want to modify an error result, it should make sure to
+	// return whatever error value it received as its argument whether that
+	// error is nil or not.
+	//
+	// The JobRow received by WorkEnd is the same one passed to HookWorkBegin's
+	// WorkBegin. Its state, errors, next scheduled at time, etc. have not yet
+	// been updated based on the latest work result.
+	//
+	// Will not receive a common context related to HookWorkBegin because
+	// WorkBegin doesn't return a context. Middleware should be used for this
+	// sort of shared context instead.
+	WorkEnd(ctx context.Context, job *JobRow, err error) error
 }
 
 // Middleware is an arbitrary interface for a struct which will execute some
@@ -397,12 +472,27 @@ type WorkerMiddleware interface {
 
 	// Work is invoked after a job's JSON args being unmarshaled and before the
 	// job is worked. Implementations must always include a call to doInner to
-	// call down the middleware stack and perform the batch insertion, and may run
-	// custom code before and after.
+	// call down the middleware stack and perform the batch insertion, and may
+	// run custom code before and after.
 	//
 	// Returning an error from this function will fail the overarching work
 	// operation, even if the inner work originally succeeded.
 	Work(ctx context.Context, job *JobRow, doInner func(context.Context) error) error
+}
+
+// DurablePeriodicJob represents a durable periodic job.
+type DurablePeriodicJob struct {
+	// ID is a unique identifier for the durable periodic job.
+	ID string
+
+	// CreatedAt is when the database record was created.
+	CreatedAt time.Time
+
+	// NextRunAt is when the periodic job is next scheduled to run.
+	NextRunAt time.Time
+
+	// UpdatedAt is when the database record was last updated.
+	UpdatedAt time.Time
 }
 
 // PeriodicJobHandle is a reference to a dynamically added periodic job
@@ -450,4 +540,14 @@ func UniqueOptsByStateDefault() []JobState {
 		JobStateRunning,
 		JobStateScheduled,
 	}
+}
+
+// WorkerMetadata is metadata about workers registered with a client.
+type WorkerMetadata struct {
+	// JobArgHooks are job args specific hooks returned from a JobArgsWithHooks
+	// implementation.
+	JobArgHooks []Hook
+
+	// Kind is the kind returned from job args and recognized by worker to work.
+	Kind string
 }

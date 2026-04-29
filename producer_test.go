@@ -18,6 +18,7 @@ import (
 	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/internal/riverinternaltest"
 	"github.com/riverqueue/river/internal/riverinternaltest/sharedtx"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
@@ -27,6 +28,7 @@ import (
 	"github.com/riverqueue/river/rivershared/testfactory"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivertype"
 )
 
@@ -44,7 +46,7 @@ func Test_Producer_CanSafelyCompleteJobsWhileFetchingNewOnes(t *testing.T) {
 
 	ctx := context.Background()
 	require := require.New(t)
-	dbPool := riverinternaltest.TestDB(ctx, t)
+	dbPool := riversharedtest.DBPool(ctx, t)
 
 	const maxJobCount = 10000
 	// This doesn't strictly mean that there are no more jobs left to process,
@@ -54,21 +56,24 @@ func Test_Producer_CanSafelyCompleteJobsWhileFetchingNewOnes(t *testing.T) {
 
 	archetype := riversharedtest.BaseServiceArchetype(t)
 
-	config := newTestConfig(t, nil)
-	dbDriver := riverpgxv5.New(dbPool)
-	exec := dbDriver.GetExecutor()
-	schema := "" // try to make tests schema-based rather than database-based in the future
-	listener := dbDriver.GetListener(schema)
-	pilot := &riverpilot.StandardPilot{}
+	var (
+		driver   = riverpgxv5.New(dbPool)
+		schema   = riverdbtest.TestSchema(ctx, t, driver, nil)
+		config   = newTestConfig(t, schema)
+		exec     = driver.GetExecutor()
+		listener = driver.GetListener(&riverdriver.GetListenenerParams{Schema: schema})
+		pilot    = &riverpilot.StandardPilot{}
+	)
 
-	subscribeCh := make(chan []jobcompleter.CompleterJobUpdated, 100)
-	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeCh))
+	subscribeChan := make(chan []jobcompleter.CompleterJobUpdated, 100)
+	t.Cleanup(riverinternaltest.DiscardContinuously(subscribeChan))
 
-	completer := jobcompleter.NewInlineCompleter(archetype, exec, &riverpilot.StandardPilot{}, subscribeCh)
+	completer := jobcompleter.NewInlineCompleter(archetype, schema, exec, &riverpilot.StandardPilot{}, subscribeChan)
 	t.Cleanup(completer.Stop)
 
 	type WithJobNumArgs struct {
-		JobArgsReflectKind[WithJobNumArgs]
+		testutil.JobArgsReflectKind[WithJobNumArgs]
+
 		JobNum int `json:"job_num"`
 	}
 
@@ -167,8 +172,7 @@ func TestProducer_PollOnly(t *testing.T) {
 			driver    = riverpgxv5.New(nil)
 			pilot     = &riverpilot.StandardPilot{}
 			queueName = fmt.Sprintf("test-producer-poll-only-%05d", randutil.IntBetween(1, 100_000))
-			schema    = "" // try to make tests schema-based rather than database-based in the future
-			tx        = riverinternaltest.TestTx(ctx, t)
+			tx        = riverdbtest.TestTxPgx(ctx, t)
 		)
 
 		// Wrap with a shared transaction because the producer fetching jobs may
@@ -180,7 +184,7 @@ func TestProducer_PollOnly(t *testing.T) {
 			jobUpdates = make(chan []jobcompleter.CompleterJobUpdated, 10)
 		)
 
-		completer := jobcompleter.NewInlineCompleter(archetype, exec, &riverpilot.StandardPilot{}, jobUpdates)
+		completer := jobcompleter.NewInlineCompleter(archetype, "", exec, &riverpilot.StandardPilot{}, jobUpdates)
 		{
 			require.NoError(t, completer.Start(ctx))
 			t.Cleanup(completer.Stop)
@@ -203,7 +207,7 @@ func TestProducer_PollOnly(t *testing.T) {
 			QueueReportInterval:          queueReportIntervalDefault,
 			RetryPolicy:                  &DefaultClientRetryPolicy{},
 			SchedulerInterval:            riverinternaltest.SchedulerShortInterval,
-			Schema:                       schema,
+			Schema:                       "",
 			StaleProducerRetentionPeriod: time.Minute,
 			Workers:                      NewWorkers(),
 		}), jobUpdates
@@ -218,17 +222,17 @@ func TestProducer_WithNotifier(t *testing.T) {
 
 		var (
 			archetype  = riversharedtest.BaseServiceArchetype(t)
-			dbPool     = riverinternaltest.TestDB(ctx, t)
+			dbPool     = riversharedtest.DBPool(ctx, t)
 			driver     = riverpgxv5.New(dbPool)
 			exec       = driver.GetExecutor()
 			jobUpdates = make(chan []jobcompleter.CompleterJobUpdated, 10)
-			schema     = "" // try to make tests schema-based rather than database-based in the future
-			listener   = driver.GetListener(schema)
+			schema     = riverdbtest.TestSchema(ctx, t, driver, nil)
+			listener   = driver.GetListener(&riverdriver.GetListenenerParams{Schema: schema})
 			pilot      = &riverpilot.StandardPilot{}
 			queueName  = fmt.Sprintf("test-producer-with-notifier-%05d", randutil.IntBetween(1, 100_000))
 		)
 
-		completer := jobcompleter.NewInlineCompleter(archetype, exec, &riverpilot.StandardPilot{}, jobUpdates)
+		completer := jobcompleter.NewInlineCompleter(archetype, schema, exec, &riverpilot.StandardPilot{}, jobUpdates)
 		{
 			require.NoError(t, completer.Start(ctx))
 			t.Cleanup(completer.Stop)
@@ -286,8 +290,8 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		timeBeforeStart := time.Now().UTC()
 
 		producer, jobUpdates := makeProducer(ctx, t)
-		producer.testSignals.Init()
-		config := newTestConfig(t, nil)
+		producer.testSignals.Init(t)
+		config := newTestConfig(t, producer.config.Schema)
 
 		jobUpdatesFlattened := make(chan jobcompleter.CompleterJobUpdated, 10)
 		go func() {
@@ -371,7 +375,8 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		producer, bundle := setup(t)
 		producer.config.QueueReportInterval = 50 * time.Millisecond
 
-		now := time.Now().UTC()
+		now := producer.Time.StubNow(time.Now().UTC())
+
 		startProducer(t, ctx, ctx, producer)
 
 		queue, err := bundle.exec.QueueGet(ctx, &riverdriver.QueueGetParams{
@@ -379,10 +384,10 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 			Schema: producer.config.Schema,
 		})
 		require.NoError(t, err)
-		require.WithinDuration(t, now, queue.CreatedAt, 2*time.Second)
+		require.WithinDuration(t, now, queue.CreatedAt, time.Microsecond)
 		require.Equal(t, []byte("{}"), queue.Metadata)
 		require.Equal(t, producer.config.Queue, queue.Name)
-		require.WithinDuration(t, now, queue.UpdatedAt, 2*time.Second)
+		require.WithinDuration(t, now, queue.UpdatedAt, time.Microsecond)
 		require.Equal(t, queue.CreatedAt, queue.UpdatedAt)
 
 		// Queue status should be updated quickly:
@@ -395,8 +400,12 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		producer, bundle := setup(t)
 		AddWorker(bundle.workers, &noOpWorker{})
 
+		type JobArgs struct {
+			testutil.JobArgsReflectKind[JobArgs]
+		}
+
 		mustInsert(ctx, t, producer, bundle, &noOpArgs{})
-		mustInsert(ctx, t, producer, bundle, &callbackArgs{}) // not registered
+		mustInsert(ctx, t, producer, bundle, &JobArgs{}) // not registered
 
 		startProducer(t, ctx, ctx, producer)
 
@@ -416,9 +425,9 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		}
 
 		{
-			job := findJob((&callbackArgs{}).Kind())
+			job := findJob((&JobArgs{}).Kind())
 			require.Equal(t, rivertype.JobStateRetryable, job.State)
-			require.Equal(t, (&UnknownJobKindError{Kind: (&callbackArgs{}).Kind()}).Error(), job.Errors[0].Error)
+			require.Equal(t, (&UnknownJobKindError{Kind: (&JobArgs{}).Kind()}).Error(), job.Errors[0].Error)
 		}
 		{
 			job := findJob((&noOpArgs{}).Kind())
@@ -432,7 +441,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		producer, bundle := setup(t)
 
 		type JobArgs struct {
-			JobArgsReflectKind[JobArgs]
+			testutil.JobArgsReflectKind[JobArgs]
 		}
 
 		AddWorker(bundle.workers, WorkFunc(func(ctx context.Context, job *Job[JobArgs]) error {
@@ -467,7 +476,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		producer.config.MaxWorkers = maxWorkers
 
 		type JobArgs struct {
-			JobArgsReflectKind[JobArgs]
+			testutil.JobArgsReflectKind[JobArgs]
 		}
 
 		unpauseWorkers := make(chan struct{})
@@ -527,6 +536,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		testfactory.Queue(ctx, t, bundle.exec, &testfactory.QueueOpts{
 			Name:     ptrutil.Ptr(producer.config.Queue),
 			PausedAt: ptrutil.Ptr(time.Now()),
+			Schema:   producer.config.Schema,
 		})
 
 		mustInsert(ctx, t, producer, bundle, &noOpArgs{})
@@ -567,7 +577,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		}))
 		if producer.config.Notifier != nil {
 			// also emit notification:
-			emitQueueNotification(t, ctx, bundle.exec, queueNameToPause, "pause", nil)
+			emitQueueNotification(t, ctx, bundle.exec, producer.config.Schema, queueNameToPause, "pause", nil)
 		}
 		producer.testSignals.Paused.WaitOrTimeout()
 
@@ -587,7 +597,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		}))
 		if producer.config.Notifier != nil {
 			// also emit notification:
-			emitQueueNotification(t, ctx, bundle.exec, queueNameToPause, "resume", nil)
+			emitQueueNotification(t, ctx, bundle.exec, producer.config.Schema, queueNameToPause, "resume", nil)
 		}
 		producer.testSignals.Resumed.WaitOrTimeout()
 
@@ -618,6 +628,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		// Delete the queue by using a future-dated horizon:
 		_, err := bundle.exec.QueueDeleteExpired(ctx, &riverdriver.QueueDeleteExpiredParams{
 			Max:              100,
+			Schema:           producer.config.Schema,
 			UpdatedAtHorizon: time.Now().Add(time.Minute),
 		})
 		require.NoError(t, err)
@@ -643,6 +654,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 				Metadata:         newMetadata,
 				MetadataDoUpdate: true,
 				Name:             producer.config.Queue,
+				Schema:           producer.config.Schema,
 			})
 			require.NoError(t, err)
 		}
@@ -652,7 +664,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 
 		if producer.config.Notifier != nil {
 			// also emit notification:
-			emitQueueNotification(t, ctx, bundle.exec, producer.config.Queue, "metadata_changed", []byte(`{"foo":"bar","baz":123}`))
+			emitQueueNotification(t, ctx, bundle.exec, producer.config.Schema, producer.config.Queue, "metadata_changed", []byte(`{"foo":"bar","baz":123}`))
 		}
 
 		producer.testSignals.MetadataChanged.WaitOrTimeout()
@@ -676,7 +688,7 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		updateMetadata(differentMetadata)
 		if producer.config.Notifier != nil {
 			// also emit notification:
-			emitQueueNotification(t, ctx, bundle.exec, producer.config.Queue, "metadata_changed", differentMetadata)
+			emitQueueNotification(t, ctx, bundle.exec, producer.config.Schema, producer.config.Queue, "metadata_changed", differentMetadata)
 		}
 
 		// Should receive a metadata changed signal since the JSON is different:
@@ -684,7 +696,25 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 	})
 }
 
-func emitQueueNotification(t *testing.T, ctx context.Context, exec riverdriver.Executor, queue, action string, metadata []byte) {
+func TestProducer_jitteredFetchPollInterval(t *testing.T) {
+	t.Parallel()
+
+	prod := &producer{}
+	prod.config = &producerConfig{
+		FetchPollInterval: 1 * time.Second,
+	}
+
+	// Run enough iterations to catch any out-of-bounds values without being
+	// flaky. The jitter range is [FetchPollInterval, FetchPollInterval +
+	// 10% of FetchPollInterval), so [1s, 1.1s).
+	for range 100 {
+		d := prod.jitteredFetchPollInterval()
+		require.GreaterOrEqual(t, d, prod.config.FetchPollInterval)
+		require.Less(t, d, prod.config.FetchPollInterval+prod.config.FetchPollInterval/10)
+	}
+}
+
+func emitQueueNotification(t *testing.T, ctx context.Context, exec riverdriver.Executor, schema, queue, action string, metadata []byte) {
 	t.Helper()
 
 	payload := map[string]any{
@@ -701,7 +731,7 @@ func emitQueueNotification(t *testing.T, ctx context.Context, exec riverdriver.E
 	err = exec.NotifyMany(ctx, &riverdriver.NotifyManyParams{
 		Topic:   string(notifier.NotificationTopicControl),
 		Payload: []string{string(payloadBytes)},
-		Schema:  "",
+		Schema:  schema,
 	})
 	require.NoError(t, err)
 }

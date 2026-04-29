@@ -1,8 +1,10 @@
 package rivertest
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -11,7 +13,7 @@ import (
 
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/internal/execution"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
@@ -51,7 +53,7 @@ func TestWorker_NewWorker(t *testing.T) {
 		return &testBundle{
 			config: &river.Config{ID: "rivertest-worker"},
 			driver: riverpgxv5.New(nil),
-			tx:     riverinternaltest.TestTx(ctx, t),
+			tx:     riverdbtest.TestTxPgx(ctx, t),
 		}
 	}
 
@@ -85,7 +87,7 @@ func TestWorker_Work(t *testing.T) {
 		var (
 			config = &river.Config{ID: "rivertest-worker"}
 			driver = riverpgxv5.New(nil)
-			tx     = riverinternaltest.TestTx(ctx, t)
+			tx     = riverdbtest.TestTxPgx(ctx, t)
 		)
 
 		return &testBundle{
@@ -203,7 +205,7 @@ func TestWorker_Work(t *testing.T) {
 
 		stubTime := &riversharedtest.TimeStub{}
 		now := time.Now().UTC()
-		stubTime.StubNowUTC(now)
+		stubTime.StubNow(now)
 		bundle.config.Test.Time = stubTime
 
 		worker := river.WorkFunc(func(ctx context.Context, job *river.Job[testArgs]) error {
@@ -220,13 +222,28 @@ func TestWorker_Work(t *testing.T) {
 		require.Equal(t, river.EventKindJobCompleted, res.EventKind)
 	})
 
-	t.Run("ReturnsASnoozeEventKindWhenSnoozed", func(t *testing.T) {
+	t.Run("ReturnsASnoozeEventKindWhenSnoozedNonZeroDuration", func(t *testing.T) {
 		t.Parallel()
 
 		bundle := setup(t)
 
 		worker := river.WorkFunc(func(ctx context.Context, job *river.Job[testArgs]) error {
 			return river.JobSnooze(time.Hour)
+		})
+		tw := NewWorker(t, bundle.driver, bundle.config, worker)
+
+		res, err := tw.Work(ctx, t, bundle.tx, testArgs{Value: "test"}, nil)
+		require.NoError(t, err)
+		require.Equal(t, river.EventKindJobSnoozed, res.EventKind)
+	})
+
+	t.Run("ReturnsASnoozeEventKindWhenSnoozedZeroDuration", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+
+		worker := river.WorkFunc(func(ctx context.Context, job *river.Job[testArgs]) error {
+			return river.JobSnooze(0)
 		})
 		tw := NewWorker(t, bundle.driver, bundle.config, worker)
 
@@ -250,13 +267,36 @@ func TestWorker_Work(t *testing.T) {
 		require.Equal(t, river.EventKindJobCancelled, res.EventKind)
 	})
 
+	t.Run("UsesACustomLoggerWhenProvided", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+
+		var logBuf bytes.Buffer
+		bundle.config.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		}))
+
+		// Return an error here because normal execution doesn't produce any
+		// logging that we can use to match on.
+		expectedErr := errors.New("my error that will be logged")
+		worker := river.WorkFunc(func(ctx context.Context, job *river.Job[testArgs]) error {
+			return expectedErr
+		})
+		tw := NewWorker(t, bundle.driver, bundle.config, worker)
+		_, err := tw.Work(ctx, t, bundle.tx, testArgs{Value: "test"}, nil)
+		require.EqualError(t, err, expectedErr.Error())
+
+		require.Contains(t, logBuf.String(), expectedErr.Error())
+	})
+
 	t.Run("UsesACustomClockWhenProvided", func(t *testing.T) {
 		t.Parallel()
 
 		bundle := setup(t)
 		hourFromNow := time.Now().UTC().Add(1 * time.Hour)
-		timeStub := &TimeStub{}
-		timeStub.StubNowUTC(hourFromNow)
+		timeStub := &riversharedtest.TimeStub{}
+		timeStub.StubNow(hourFromNow)
 		bundle.config.Test.Time = timeStub
 
 		worker := river.WorkFunc(func(ctx context.Context, job *river.Job[testArgs]) error {
@@ -440,7 +480,7 @@ func TestWorker_WorkJob(t *testing.T) {
 			client:   client,
 			config:   config,
 			driver:   driver,
-			tx:       riverinternaltest.TestTx(ctx, t),
+			tx:       riverdbtest.TestTxPgx(ctx, t),
 			workFunc: func(ctx context.Context, job *river.Job[testArgs]) error { return nil },
 		}
 

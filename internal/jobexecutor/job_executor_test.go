@@ -3,6 +3,7 @@ package jobexecutor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +17,13 @@ import (
 	"github.com/riverqueue/river/internal/riverinternaltest"
 	"github.com/riverqueue/river/internal/riverinternaltest/retrypolicytest"
 	"github.com/riverqueue/river/internal/workunit"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riverpilot"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/testfactory"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -126,11 +129,11 @@ func TestJobExecutor_Execute(t *testing.T) {
 		t.Helper()
 
 		var (
-			tx        = riverinternaltest.TestTx(ctx, t)
+			tx        = riverdbtest.TestTxPgx(ctx, t)
 			archetype = riversharedtest.BaseServiceArchetype(t)
 			exec      = riverpgxv5.New(nil).UnwrapExecutor(tx)
 			updateCh  = make(chan []jobcompleter.CompleterJobUpdated, 10)
-			completer = jobcompleter.NewInlineCompleter(archetype, exec, &riverpilot.StandardPilot{}, updateCh)
+			completer = jobcompleter.NewInlineCompleter(archetype, "", exec, &riverpilot.StandardPilot{}, updateCh)
 		)
 
 		t.Cleanup(completer.Stop)
@@ -158,9 +161,9 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 		// Fetch the job to make sure it's marked as running:
 		jobs, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
-			Max:   1,
-			Now:   ptrutil.Ptr(now),
-			Queue: rivercommon.QueueDefault,
+			MaxToLock: 1,
+			Now:       ptrutil.Ptr(now),
+			Queue:     rivercommon.QueueDefault,
 		})
 		require.NoError(t, err)
 
@@ -188,11 +191,19 @@ func TestJobExecutor_Execute(t *testing.T) {
 			ErrorHandler:             bundle.errorHandler,
 			HookLookupByJob:          hooklookup.NewJobHookLookup(),
 			HookLookupGlobal:         hooklookup.NewHookLookup(nil),
-			InformProducerDoneFunc:   func(job *rivertype.JobRow) {},
 			JobRow:                   bundle.jobRow,
 			MiddlewareLookupGlobal:   middlewarelookup.NewMiddlewareLookup(nil),
-			SchedulerInterval:        riverinternaltest.SchedulerShortInterval,
-			WorkUnit:                 workUnitFactory.MakeUnit(bundle.jobRow),
+			ProducerCallbacks: struct {
+				JobDone func(jobRow *rivertype.JobRow)
+				Stuck   func()
+				Unstuck func()
+			}{
+				JobDone: func(jobRow *rivertype.JobRow) {},
+				Stuck:   func() {},
+				Unstuck: func() {},
+			},
+			SchedulerInterval: riverinternaltest.SchedulerShortInterval,
+			WorkUnit:          workUnitFactory.MakeUnit(bundle.jobRow),
 		})
 
 		return executor, bundle
@@ -240,7 +251,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 		executor, bundle := setup(t)
 
-		now := executor.Time.StubNowUTC(time.Now().UTC())
+		now := executor.Time.StubNow(time.Now().UTC())
 
 		workerErr := errors.New("job error")
 		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error { return workerErr }, nil).MakeUnit(bundle.jobRow)
@@ -307,7 +318,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 			require.Equal(t, rivertype.JobStateAvailable, job.State)
 		}
 
-		_, err := bundle.exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+		_, err := bundle.exec.JobUpdateFull(ctx, &riverdriver.JobUpdateFullParams{
 			ID:            bundle.jobRow.ID,
 			StateDoUpdate: true,
 			State:         rivertype.JobStateRunning,
@@ -362,7 +373,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 		// add a unique key so we can verify it's cleared
 		var err error
-		bundle.jobRow, err = bundle.exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+		bundle.jobRow, err = bundle.exec.JobUpdateFull(ctx, &riverdriver.JobUpdateFullParams{
 			ID:    bundle.jobRow.ID,
 			State: rivertype.JobStateAvailable, // required for encoding but ignored
 		})
@@ -573,6 +584,262 @@ func TestJobExecutor_Execute(t *testing.T) {
 		require.True(t, bundle.errorHandler.HandleErrorCalled)
 	})
 
+	t.Run("ExpandableErrorsApplyToMultipleJobsIndividually", func(t *testing.T) {
+		makeExtraRunningJobs := func(t *testing.T, exec riverdriver.Executor) []*rivertype.JobRow {
+			t.Helper()
+
+			now := time.Now().UTC()
+			_, err := exec.JobInsertFullMany(ctx, &riverdriver.JobInsertFullManyParams{
+				Jobs: []*riverdriver.JobInsertFullParams{
+					testfactory.Job_Build(t, &testfactory.JobOpts{Kind: ptrutil.Ptr("jobexecutor_test"), ScheduledAt: &now}),
+					testfactory.Job_Build(t, &testfactory.JobOpts{Kind: ptrutil.Ptr("jobexecutor_test"), ScheduledAt: &now}),
+					testfactory.Job_Build(t, &testfactory.JobOpts{Kind: ptrutil.Ptr("jobexecutor_test"), ScheduledAt: &now}),
+				},
+			})
+			require.NoError(t, err)
+
+			locked, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+				MaxToLock: 3,
+				Now:       &now,
+				Queue:     rivercommon.QueueDefault,
+			})
+			require.NoError(t, err)
+			require.Len(t, locked, 3)
+			return locked
+		}
+
+		t.Run("AllJobsShareSameNormalError", func(t *testing.T) {
+			t.Parallel()
+
+			executor, bundle := setup(t)
+			allJobs := append([]*rivertype.JobRow{bundle.jobRow}, makeExtraRunningJobs(t, bundle.exec)...)
+
+			errAll := errors.New("job error")
+			perJob := map[int64]error{
+				allJobs[0].ID: errAll,
+				allJobs[1].ID: errAll,
+				allJobs[2].ID: errAll,
+				allJobs[3].ID: errAll,
+			}
+			executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+				return &errorBundle{errorsByID: perJob, jobs: allJobs}
+			}, nil).MakeUnit(bundle.jobRow)
+
+			executor.Execute(ctx)
+			riversharedtest.WaitOrTimeoutN(t, bundle.updateCh, len(allJobs))
+
+			for i, j := range allJobs {
+				got, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: j.ID, Schema: ""})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateRetryable, got.State, "expected job %d to be retryable, got %s", i, got.State)
+				require.Len(t, got.Errors, 1)
+				require.Equal(t, "job error", got.Errors[0].Error)
+			}
+		})
+
+		t.Run("OnlySomeJobsHaveErrors", func(t *testing.T) {
+			t.Parallel()
+
+			executor, bundle := setup(t)
+			allJobs := append([]*rivertype.JobRow{bundle.jobRow}, makeExtraRunningJobs(t, bundle.exec)...)
+
+			errSome := errors.New("job error")
+			perJob := map[int64]error{
+				allJobs[0].ID: errSome,
+				// allJobs[1] omitted -> success
+				allJobs[2].ID: errSome,
+				allJobs[3].ID: nil, // explicit nil: success
+			}
+			executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+				return &errorBundle{errorsByID: perJob, jobs: allJobs}
+			}, nil).MakeUnit(bundle.jobRow)
+
+			executor.Execute(ctx)
+			riversharedtest.WaitOrTimeoutN(t, bundle.updateCh, len(allJobs))
+
+			// errored jobs -> retryable with 1 error
+			for _, idx := range []int{0, 2} {
+				got, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: allJobs[idx].ID, Schema: ""})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateRetryable, got.State)
+				require.Len(t, got.Errors, 1)
+				require.Equal(t, "job error", got.Errors[0].Error)
+			}
+
+			// successful jobs -> completed, no errors
+			for _, idx := range []int{1, 3} {
+				got, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: allJobs[idx].ID, Schema: ""})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateCompleted, got.State)
+				require.Empty(t, got.Errors)
+			}
+		})
+
+		t.Run("AllJobsHaveErrorsViaBundle", func(t *testing.T) {
+			t.Parallel()
+
+			executor, bundle := setup(t)
+			allJobs := append([]*rivertype.JobRow{bundle.jobRow}, makeExtraRunningJobs(t, bundle.exec)...)
+
+			perJob := map[int64]error{
+				allJobs[0].ID: errors.New("job error 0"),
+				allJobs[1].ID: errors.New("job error 1"),
+				allJobs[2].ID: errors.New("job error 2"),
+				allJobs[3].ID: errors.New("job error 3"),
+			}
+			executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+				return &errorBundle{errorsByID: perJob, jobs: allJobs}
+			}, nil).MakeUnit(bundle.jobRow)
+
+			executor.Execute(ctx)
+			riversharedtest.WaitOrTimeoutN(t, bundle.updateCh, len(allJobs))
+
+			for i, j := range allJobs {
+				got, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: j.ID, Schema: ""})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateRetryable, got.State)
+				require.Len(t, got.Errors, 1)
+				require.Equal(t, fmt.Sprintf("job error %d", i), got.Errors[0].Error)
+			}
+		})
+	})
+
+	configureStuckDetection := func(executor *JobExecutor) {
+		executor.ClientJobTimeout = 5 * time.Millisecond
+		executor.StuckThresholdOverride = 1 * time.Nanosecond // must be greater than 0 to take effect
+	}
+
+	t.Run("StuckDetectionActivatesForClientTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		configureStuckDetection(executor)
+
+		var (
+			informProducerStuckReceived   = make(chan struct{})
+			informProducerUnstuckReceived = make(chan struct{})
+		)
+		executor.ProducerCallbacks.Stuck = func() {
+			t.Log("Job executor reported stuck")
+			close(informProducerStuckReceived)
+		}
+		executor.ProducerCallbacks.Unstuck = func() {
+			t.Log("Job executor reported unstuck (after being stuck)")
+			close(informProducerUnstuckReceived)
+		}
+
+		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+			riversharedtest.WaitOrTimeout(t, informProducerStuckReceived)
+
+			select {
+			case <-informProducerUnstuckReceived:
+				require.FailNow(t, "Executor should not have reported unstuck immediately")
+			case <-time.After(10 * time.Millisecond):
+				t.Log("Job executor still stuck after wait (this is expected)")
+			}
+
+			return nil
+		}, nil).MakeUnit(bundle.jobRow)
+
+		executor.Execute(ctx)
+		_ = riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+
+		riversharedtest.WaitOrTimeout(t, informProducerUnstuckReceived)
+	})
+
+	t.Run("StuckDetectionActivatesForWorkerTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		// Does not use configureStuckDetection to avoid ClientJobTimeout being
+		// set. Instead, customizableWorkUnit.timeout is set below instead.
+		executor.StuckThresholdOverride = 1 * time.Nanosecond // must be greater than 0 to take effect
+
+		var (
+			informProducerStuckReceived   = make(chan struct{})
+			informProducerUnstuckReceived = make(chan struct{})
+		)
+		executor.ProducerCallbacks.Stuck = func() {
+			t.Log("Job executor reported stuck")
+			close(informProducerStuckReceived)
+		}
+		executor.ProducerCallbacks.Unstuck = func() {
+			t.Log("Job executor reported unstuck (after being stuck)")
+			close(informProducerUnstuckReceived)
+		}
+
+		workUnit := &customizableWorkUnit{
+			timeout: 5 * time.Millisecond,
+			work: func() error {
+				riversharedtest.WaitOrTimeout(t, informProducerStuckReceived)
+
+				select {
+				case <-informProducerUnstuckReceived:
+					require.FailNow(t, "Executor should not have reported unstuck immediately")
+				case <-time.After(10 * time.Millisecond):
+					t.Log("Job executor still stuck after wait (this is expected)")
+				}
+
+				return nil
+			},
+		}
+
+		executor.WorkUnit = (&workUnitFactory{
+			workUnit: workUnit,
+		}).MakeUnit(bundle.jobRow)
+
+		executor.Execute(ctx)
+		_ = riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+
+		riversharedtest.WaitOrTimeout(t, informProducerUnstuckReceived)
+	})
+
+	// Checks that even if a work context is cancelled immediately, stuck
+	// detection still works as expected.
+	t.Run("StuckDetectionIgnoresParentContextCancellation", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		configureStuckDetection(executor)
+
+		var (
+			informProducerStuckReceived   = make(chan struct{})
+			informProducerUnstuckReceived = make(chan struct{})
+		)
+		executor.ProducerCallbacks.Stuck = func() {
+			t.Log("Job executor reported stuck")
+			close(informProducerStuckReceived)
+		}
+		executor.ProducerCallbacks.Unstuck = func() {
+			t.Log("Job executor reported unstuck (after being stuck)")
+			close(informProducerUnstuckReceived)
+		}
+
+		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+			riversharedtest.WaitOrTimeout(t, informProducerStuckReceived)
+
+			select {
+			case <-informProducerUnstuckReceived:
+				require.FailNow(t, "Executor should not have reported unstuck immediately")
+			case <-time.After(10 * time.Millisecond):
+				t.Log("Job executor still stuck after wait (this is expected)")
+			}
+
+			return nil
+		}, nil).MakeUnit(bundle.jobRow)
+
+		ctx, cancel := context.WithCancel(ctx)
+		cancel() // cancel immediately
+
+		executor.Execute(ctx)
+		_ = riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+
+		riversharedtest.WaitOrTimeout(t, informProducerUnstuckReceived)
+	})
+
 	t.Run("Panic", func(t *testing.T) {
 		t.Parallel()
 
@@ -591,7 +858,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 		require.Equal(t, rivertype.JobStateRetryable, job.State)
 		require.Len(t, job.Errors, 1)
 		// Sufficient enough to ensure that the stack trace is included:
-		require.Contains(t, job.Errors[0].Trace, "river/internal/jobexecutor/job_executor.go")
+		require.Contains(t, job.Errors[0].Trace, "internal/jobexecutor/job_executor.go")
 	})
 
 	t.Run("PanicAgainAfterRetry", func(t *testing.T) {
@@ -760,7 +1027,7 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 		go func() {
 			<-jobStarted
-			executor.Cancel()
+			executor.Cancel(ctx)
 			close(haveCancelled)
 		}()
 
@@ -803,7 +1070,126 @@ func TestJobExecutor_Execute(t *testing.T) {
 		require.Equal(t, rivertype.JobStateCompleted, job.State)
 		require.Empty(t, job.Errors)
 	})
+
+	t.Run("WorkHooks", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		var (
+			workBeginCalled bool
+			workEndCalled   bool
+		)
+		executor.HookLookupGlobal = hooklookup.NewHookLookup([]rivertype.Hook{
+			HookWorkBeginFunc(func(ctx context.Context, job *rivertype.JobRow) error {
+				workBeginCalled = true
+				return nil
+			}),
+			HookWorkEndFunc(func(ctx context.Context, job *rivertype.JobRow, err error) error {
+				workEndCalled = true
+				return err
+			}),
+		})
+		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error { return nil }, nil).MakeUnit(bundle.jobRow)
+
+		executor.Execute(ctx)
+		jobsUpdated := riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+		require.Len(t, jobsUpdated, 1)
+		require.Empty(t, jobsUpdated[0].Job.Errors)
+
+		require.True(t, workBeginCalled)
+		require.True(t, workEndCalled)
+	})
+
+	t.Run("WorkEndErrorPassThrough", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		var (
+			workEnd1Called bool
+			workEnd2Called bool
+		)
+		executor.HookLookupGlobal = hooklookup.NewHookLookup([]rivertype.Hook{
+			HookWorkEndFunc(func(ctx context.Context, job *rivertype.JobRow, err error) error {
+				workEnd1Called = true
+				require.EqualError(t, err, "job error")
+				return err
+			}),
+			HookWorkEndFunc(func(ctx context.Context, job *rivertype.JobRow, err error) error {
+				workEnd2Called = true
+				require.EqualError(t, err, "job error")
+				return err
+			}),
+		})
+		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+			return errors.New("job error")
+		}, nil).MakeUnit(bundle.jobRow)
+
+		executor.Execute(ctx)
+		jobsUpdated := riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+		require.Len(t, jobsUpdated, 1)
+		require.Equal(t, "job error", jobsUpdated[0].Job.Errors[0].Error)
+
+		require.True(t, workEnd1Called)
+		require.True(t, workEnd2Called)
+	})
+
+	t.Run("WorkEndErrorSuppression", func(t *testing.T) {
+		t.Parallel()
+
+		executor, bundle := setup(t)
+
+		var (
+			workEnd1Called bool
+			workEnd2Called bool
+		)
+		executor.HookLookupGlobal = hooklookup.NewHookLookup([]rivertype.Hook{
+			HookWorkEndFunc(func(ctx context.Context, job *rivertype.JobRow, err error) error {
+				workEnd1Called = true
+				require.EqualError(t, err, "job error")
+				return err
+			}),
+			HookWorkEndFunc(func(ctx context.Context, job *rivertype.JobRow, err error) error {
+				workEnd2Called = true
+				require.EqualError(t, err, "job error")
+				return nil // second hook suppresses the error
+			}),
+		})
+		executor.WorkUnit = newWorkUnitFactoryWithCustomRetry(func() error {
+			return errors.New("job error")
+		}, nil).MakeUnit(bundle.jobRow)
+
+		executor.Execute(ctx)
+		jobsUpdated := riversharedtest.WaitOrTimeout(t, bundle.updateCh)
+		require.Len(t, jobsUpdated, 1)
+		require.Empty(t, jobsUpdated[0].Job.Errors)
+
+		require.True(t, workEnd1Called)
+		require.True(t, workEnd2Called)
+	})
 }
+
+//
+// *Func types are copied from the top level River package because they can't be
+// accessed from here.
+//
+
+type HookWorkBeginFunc func(ctx context.Context, job *rivertype.JobRow) error
+
+func (f HookWorkBeginFunc) WorkBegin(ctx context.Context, job *rivertype.JobRow) error {
+	return f(ctx, job)
+}
+
+func (f HookWorkBeginFunc) IsHook() bool { return true }
+
+type HookWorkEndFunc func(ctx context.Context, job *rivertype.JobRow, err error) error
+
+func (f HookWorkEndFunc) WorkEnd(ctx context.Context, job *rivertype.JobRow, err error) error {
+	return f(ctx, job, err)
+}
+
+func (f HookWorkEndFunc) IsHook() bool { return true }
 
 type testMiddleware struct {
 	work func(ctx context.Context, job *rivertype.JobRow, next func(context.Context) error) error
@@ -814,3 +1200,16 @@ func (m *testMiddleware) IsMiddleware() bool { return true }
 func (m *testMiddleware) Work(ctx context.Context, job *rivertype.JobRow, next func(context.Context) error) error {
 	return m.work(ctx, job, next)
 }
+
+// errorBundle is for testing withJobAndErrorsByID.
+type errorBundle struct { //nolint:errname
+	errorsByID map[int64]error
+	jobs       []*rivertype.JobRow
+}
+
+func (eb *errorBundle) Error() string { return "error bundle" }
+
+func (eb *errorBundle) ErrorsByID() map[int64]error { return eb.errorsByID }
+func (eb *errorBundle) Jobs() []*rivertype.JobRow   { return eb.jobs }
+
+var _ withJobsAndErrorsByID = (*errorBundle)(nil)

@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riverpilot"
@@ -28,9 +28,16 @@ func TestClientDriverPlugin(t *testing.T) {
 	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
 		t.Helper()
 
-		pluginDriver := newDriverWithPlugin(t, riverinternaltest.TestDB(ctx, t))
+		var (
+			dbPool = riversharedtest.DBPool(ctx, t)
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+			config = newTestConfig(t, schema)
+		)
 
-		client, err := NewClient(pluginDriver, newTestConfig(t, nil))
+		pluginDriver := newDriverWithPlugin(t, dbPool)
+
+		client, err := NewClient(pluginDriver, config)
 		require.NoError(t, err)
 
 		return client, &testBundle{
@@ -53,6 +60,7 @@ var _ driverPlugin[pgx.Tx] = &TestDriverWithPlugin{}
 
 type TestDriverWithPlugin struct {
 	*riverpgxv5.Driver
+
 	initCalled bool
 	pilot      riverpilot.Pilot
 }
@@ -90,11 +98,17 @@ func TestClientPilotPlugin(t *testing.T) {
 	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
 		t.Helper()
 
-		pluginDriver := newDriverWithPlugin(t, riverinternaltest.TestDB(ctx, t))
-		pluginPilot := newPilotWithPlugin(t)
+		var (
+			dbPool       = riversharedtest.DBPool(ctx, t)
+			driver       = riverpgxv5.New(dbPool)
+			schema       = riverdbtest.TestSchema(ctx, t, driver, nil)
+			config       = newTestConfig(t, schema)
+			pluginDriver = newDriverWithPlugin(t, dbPool)
+			pluginPilot  = newPilotWithPlugin(t)
+		)
 		pluginDriver.pilot = pluginPilot
 
-		client, err := NewClient(pluginDriver, newTestConfig(t, nil))
+		client, err := NewClient(pluginDriver, config)
 		require.NoError(t, err)
 
 		return client, &testBundle{
@@ -121,6 +135,7 @@ var _ pilotPlugin = &TestPilotWithPlugin{}
 
 type TestPilotWithPlugin struct {
 	riverpilot.StandardPilot
+
 	maintenanceService startstop.Service
 	service            startstop.Service
 }

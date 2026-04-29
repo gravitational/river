@@ -10,7 +10,7 @@ import (
 
 	"github.com/riverqueue/river/internal/jobcompleter"
 	"github.com/riverqueue/river/internal/jobstats"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
@@ -34,7 +34,7 @@ func Test_SubscriptionManager(t *testing.T) {
 	setup := func(t *testing.T) (*subscriptionManager, *testBundle) {
 		t.Helper()
 
-		tx := riverinternaltest.TestTx(ctx, t)
+		tx := riverdbtest.TestTxPgx(ctx, t)
 		exec := riverpgxv5.New(nil).UnwrapExecutor(tx)
 
 		subscribeCh := make(chan []jobcompleter.CompleterJobUpdated, 1)
@@ -78,8 +78,8 @@ func Test_SubscriptionManager(t *testing.T) {
 			{Job: job2, JobStats: makeStats(201, 202, 203)}, // cancelled, should be skipped
 		}
 		bundle.subscribeCh <- []jobcompleter.CompleterJobUpdated{
-			{Job: job3, JobStats: makeStats(301, 302, 303)}, // retryable, should be skipped
-			{Job: job4, JobStats: makeStats(401, 402, 403)}, // snoozed/scheduled, should be sent
+			{Job: job3, JobStats: makeStats(301, 302, 303)},                // retryable, should be skipped
+			{Job: job4, JobStats: makeStats(401, 402, 403), Snoozed: true}, // snoozed/scheduled, should be sent
 		}
 
 		received := riversharedtest.WaitOrTimeoutN(t, sub, 2)

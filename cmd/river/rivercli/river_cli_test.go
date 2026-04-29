@@ -5,23 +5,63 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"net/url"
-	"os"
 	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 
+	"github.com/riverqueue/river/cmd/river/riverbench"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 )
+
+type DriverProcurerStub struct {
+	getBenchmarkerStub func(config *riverbench.Config) BenchmarkerInterface
+	getMigratorStub    func(config *rivermigrate.Config) (MigratorInterface, error)
+	initPgxV5Stub      func(pool *pgxpool.Pool)
+	queryRowStub       func(ctx context.Context, sql string, args ...any) riverdriver.Row
+}
+
+func (p *DriverProcurerStub) GetBenchmarker(config *riverbench.Config) BenchmarkerInterface {
+	if p.getBenchmarkerStub == nil {
+		panic("GetBenchmarker is not stubbed")
+	}
+
+	return p.getBenchmarkerStub(config)
+}
+
+func (p *DriverProcurerStub) GetMigrator(config *rivermigrate.Config) (MigratorInterface, error) {
+	if p.getMigratorStub == nil {
+		panic("GetMigrator is not stubbed")
+	}
+
+	return p.getMigratorStub(config)
+}
+
+func (p *DriverProcurerStub) InitPgxV5(pool *pgxpool.Pool) {
+	if p.initPgxV5Stub == nil {
+		panic("InitPgxV5 is not stubbed")
+	}
+
+	p.initPgxV5Stub(pool)
+}
+
+func (p *DriverProcurerStub) QueryRow(ctx context.Context, sql string, args ...any) riverdriver.Row {
+	if p.queryRowStub == nil {
+		panic("QueryRow is not stubbed")
+	}
+
+	return p.queryRowStub(ctx, sql, args...)
+}
 
 type MigratorStub struct {
 	allVersionsStub      func() []rivermigrate.Migration
@@ -48,7 +88,7 @@ func (m *MigratorStub) ExistingVersions(ctx context.Context) ([]rivermigrate.Mig
 }
 
 func (m *MigratorStub) GetVersion(version int) (rivermigrate.Migration, error) {
-	if m.allVersionsStub == nil {
+	if m.getVersionStub == nil {
 		panic("GetVersion is not stubbed")
 	}
 
@@ -56,7 +96,7 @@ func (m *MigratorStub) GetVersion(version int) (rivermigrate.Migration, error) {
 }
 
 func (m *MigratorStub) Migrate(ctx context.Context, direction rivermigrate.Direction, opts *rivermigrate.MigrateOpts) (*rivermigrate.MigrateResult, error) {
-	if m.allVersionsStub == nil {
+	if m.migrateStub == nil {
 		panic("Migrate is not stubbed")
 	}
 
@@ -64,7 +104,7 @@ func (m *MigratorStub) Migrate(ctx context.Context, direction rivermigrate.Direc
 }
 
 func (m *MigratorStub) Validate(ctx context.Context) (*rivermigrate.ValidateResult, error) {
-	if m.allVersionsStub == nil {
+	if m.validateStub == nil {
 		panic("Validate is not stubbed")
 	}
 
@@ -72,18 +112,12 @@ func (m *MigratorStub) Validate(ctx context.Context) (*rivermigrate.ValidateResu
 }
 
 var (
-	testMigration01 = rivermigrate.Migration{Name: "1st migration", SQLDown: "SELECT 1", SQLUp: "SELECT 1", Version: 1} //nolint:gochecknoglobals
-	testMigration02 = rivermigrate.Migration{Name: "2nd migration", SQLDown: "SELECT 1", SQLUp: "SELECT 1", Version: 2} //nolint:gochecknoglobals
-	testMigration03 = rivermigrate.Migration{Name: "3rd migration", SQLDown: "SELECT 1", SQLUp: "SELECT 1", Version: 3} //nolint:gochecknoglobals
+	testMigration01 = rivermigrate.Migration{Name: "1st migration", SQLDown: "SELECT 'down 1' FROM /* TEMPLATE: schema */river_table", SQLUp: "SELECT 'up 1' FROM /* TEMPLATE: schema */river_table", Version: 1} //nolint:gochecknoglobals
+	testMigration02 = rivermigrate.Migration{Name: "2nd migration", SQLDown: "SELECT 'down 2' FROM /* TEMPLATE: schema */river_table", SQLUp: "SELECT 'up 2' FROM /* TEMPLATE: schema */river_table", Version: 2} //nolint:gochecknoglobals
+	testMigration03 = rivermigrate.Migration{Name: "3rd migration", SQLDown: "SELECT 'down 3' FROM /* TEMPLATE: schema */river_table", SQLUp: "SELECT 'up 3' FROM /* TEMPLATE: schema */river_table", Version: 3} //nolint:gochecknoglobals
 
 	testMigrationAll = []rivermigrate.Migration{testMigration01, testMigration02, testMigration03} //nolint:gochecknoglobals
 )
-
-type TestDriverProcurer struct{}
-
-func (p *TestDriverProcurer) ProcurePgxV5(pool *pgxpool.Pool) riverdriver.Driver[pgx.Tx] {
-	return riverpgxv5.New(pool)
-}
 
 // High level integration tests that operate on the Cobra command directly. This
 // isn't always appropriate because there's no way to inject a test transaction.
@@ -98,8 +132,7 @@ func TestBaseCommandSetIntegration(t *testing.T) {
 		t.Helper()
 
 		cli := NewCLI(&Config{
-			DriverProcurer: &TestDriverProcurer{},
-			Name:           "River",
+			Name: "River",
 		})
 
 		var out bytes.Buffer
@@ -125,7 +158,7 @@ func TestBaseCommandSetIntegration(t *testing.T) {
 		cmd, _ := setup(t)
 
 		cmd.SetArgs([]string{"migrate-down", "--database-url", "post://"})
-		require.EqualError(t, cmd.Execute(), "unsupported database URL (`post://`); try one with a `postgres://` or `postgresql://` scheme/prefix")
+		require.EqualError(t, cmd.Execute(), "unsupported database URL (`post://`); try one with a `postgres://`, `postgresql://`, or `sqlite://` scheme/prefix")
 	})
 
 	t.Run("MissingDatabaseURLAndPGEnv", func(t *testing.T) {
@@ -135,6 +168,34 @@ func TestBaseCommandSetIntegration(t *testing.T) {
 
 		cmd.SetArgs([]string{"migrate-down"})
 		require.EqualError(t, cmd.Execute(), "either PG* env vars or --database-url must be set")
+	})
+
+	t.Run("StatementTimeoutValidation", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("AllowsGreaterThanOneMillisecond", func(t *testing.T) {
+			t.Parallel()
+
+			cmd, _ := setup(t)
+			cmd.SetArgs([]string{"--statement-timeout", "2ms", "--version"})
+			require.NoError(t, cmd.Execute())
+		})
+
+		t.Run("RejectsOneMillisecond", func(t *testing.T) {
+			t.Parallel()
+
+			cmd, _ := setup(t)
+			cmd.SetArgs([]string{"--statement-timeout", "1ms", "--version"})
+			require.EqualError(t, cmd.Execute(), "`--statement-timeout` must be greater than 1ms when set")
+		})
+
+		t.Run("RejectsZero", func(t *testing.T) {
+			t.Parallel()
+
+			cmd, _ := setup(t)
+			cmd.SetArgs([]string{"--statement-timeout", "0", "--version"})
+			require.EqualError(t, cmd.Execute(), "`--statement-timeout` must be greater than 1ms when set")
+		})
 	})
 
 	t.Run("VersionFlag", func(t *testing.T) {
@@ -147,8 +208,9 @@ func TestBaseCommandSetIntegration(t *testing.T) {
 
 		buildInfo, _ := debug.ReadBuildInfo()
 
-		require.Equal(t, strings.TrimSpace(fmt.Sprintf(`
-River version (unknown)
+		// `devel` on 1.25, `unknown` on versions previous to that
+		require.Regexp(t, strings.TrimSpace(fmt.Sprintf(`
+River version \((devel|unknown)\)
 Built with %s
 		`, buildInfo.GoVersion)), strings.TrimSpace(bundle.out.String()))
 	})
@@ -163,8 +225,9 @@ Built with %s
 
 		buildInfo, _ := debug.ReadBuildInfo()
 
-		require.Equal(t, strings.TrimSpace(fmt.Sprintf(`
-River version (unknown)
+		// `devel` on 1.25, `unknown` on versions previous to that
+		require.Regexp(t, strings.TrimSpace(fmt.Sprintf(`
+River version \((devel|unknown)\)
 Built with %s
 		`, buildInfo.GoVersion)), strings.TrimSpace(bundle.out.String()))
 	})
@@ -174,6 +237,8 @@ Built with %s
 // out into its own test block so that we don't have to mark the entire block
 // above as non-parallel because a few tests can't be made parallel.
 func TestBaseCommandSetNonParallel(t *testing.T) {
+	ctx := context.Background()
+
 	type testBundle struct {
 		out *bytes.Buffer
 	}
@@ -182,8 +247,7 @@ func TestBaseCommandSetNonParallel(t *testing.T) {
 		t.Helper()
 
 		cli := NewCLI(&Config{
-			DriverProcurer: &TestDriverProcurer{},
-			Name:           "River",
+			Name: "River",
 		})
 
 		var out bytes.Buffer
@@ -197,29 +261,292 @@ func TestBaseCommandSetNonParallel(t *testing.T) {
 	t.Run("PGEnvWithoutDatabaseURL", func(t *testing.T) {
 		cmd, _ := setup(t)
 
-		// Deconstruct a database URL into its PG* components. This path is the
-		// one that gets taken in CI, but could work locally as well.
-		if databaseURL := os.Getenv("TEST_DATABASE_URL"); databaseURL != "" {
-			parsedURL, err := url.Parse(databaseURL)
-			require.NoError(t, err)
+		testDatabaseURL := riversharedtest.TestDatabaseURL()
 
-			t.Setenv("PGDATABASE", parsedURL.Path[1:])
-			t.Setenv("PGHOST", parsedURL.Hostname())
-			pass, _ := parsedURL.User.Password()
-			t.Setenv("PGPASSWORD", pass)
-			t.Setenv("PGPORT", cmp.Or(parsedURL.Port(), "5432"))
-			t.Setenv("PGSSLMODE", parsedURL.Query().Get("sslmode"))
-			t.Setenv("PGUSER", parsedURL.User.Username())
-		} else {
-			// With no `TEST_DATABASE_URL` available, try a simpler alternative
-			// configuration. Requires a database on localhost that doesn't
-			// require authentication, which should exist from testdbman.
-			t.Setenv("PGDATABASE", "river_test")
-			t.Setenv("PGHOST", "localhost")
+		config, err := pgxpool.ParseConfig(testDatabaseURL)
+		require.NoError(t, err)
+
+		dbPool, err := pgxpool.NewWithConfig(ctx, config)
+		require.NoError(t, err)
+
+		var (
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+		)
+
+		t.Setenv("TEST_DATABASE_URL", "")
+
+		parsedURL, err := url.Parse(testDatabaseURL)
+		require.NoError(t, err)
+
+		t.Setenv("PGDATABASE", parsedURL.Path[1:])
+		t.Setenv("PGHOST", parsedURL.Hostname())
+		pass, _ := parsedURL.User.Password()
+		t.Setenv("PGPASSWORD", pass)
+		t.Setenv("PGPORT", cmp.Or(parsedURL.Port(), "5432"))
+		t.Setenv("PGSSLMODE", parsedURL.Query().Get("sslmode"))
+		t.Setenv("PGUSER", parsedURL.User.Username())
+
+		cmd.SetArgs([]string{"migrate-up", "--schema", schema})
+		require.NoError(t, cmd.Execute())
+	})
+}
+
+func TestBaseCommandSetPostgresTimeoutPrecedence(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		databaseURLStatementTimeout string
+		expectedStatementTimeoutMS  string
+		name                        string
+		statementTimeoutFlag        string
+	}
+
+	makeCommandAndParams := func(t *testing.T) (*cobra.Command, func() map[string]string) {
+		t.Helper()
+
+		var capturedRuntimeParams map[string]string
+
+		migratorStub := &MigratorStub{}
+		migratorStub.allVersionsStub = func() []rivermigrate.Migration { return []rivermigrate.Migration{testMigration01} }
+		migratorStub.getVersionStub = func(version int) (rivermigrate.Migration, error) {
+			if version == 1 {
+				return testMigration01, nil
+			}
+
+			return rivermigrate.Migration{}, fmt.Errorf("unknown version: %d", version)
+		}
+		migratorStub.existingVersionsStub = func(ctx context.Context) ([]rivermigrate.Migration, error) { return nil, nil }
+
+		cli := NewCLI(&Config{
+			DriverProcurer: &DriverProcurerStub{
+				getMigratorStub: func(config *rivermigrate.Config) (MigratorInterface, error) {
+					return migratorStub, nil
+				},
+				initPgxV5Stub: func(pool *pgxpool.Pool) {
+					capturedRuntimeParams = maps.Clone(pool.Config().ConnConfig.RuntimeParams)
+				},
+			},
+			Name: "River",
+		})
+
+		var out bytes.Buffer
+		cli.SetOut(&out)
+
+		return cli.BaseCommandSet(), func() map[string]string {
+			return capturedRuntimeParams
+		}
+	}
+
+	makeBaseDatabaseURL := func(t *testing.T) *url.URL {
+		t.Helper()
+
+		testDatabaseURL := riversharedtest.TestDatabaseURL()
+		parsedDatabaseURL, err := url.Parse(testDatabaseURL)
+		require.NoError(t, err)
+
+		return parsedDatabaseURL
+	}
+
+	testCases := []testCase{
+		{
+			name:                       "DefaultsAppliedWhenNothingSpecified",
+			expectedStatementTimeoutMS: "10000",
+		},
+		{
+			databaseURLStatementTimeout: "11234",
+			name:                        "DatabaseURLQueryParamsOverrideDefaults",
+			expectedStatementTimeoutMS:  "11234",
+		},
+		{
+			databaseURLStatementTimeout: "12345",
+			name:                        "ExplicitFlagsOverrideDatabaseURLQueryParams",
+			statementTimeoutFlag:        "1m3.123s",
+			expectedStatementTimeoutMS:  "63123",
+		},
+		{
+			databaseURLStatementTimeout: "12345",
+			name:                        "ExplicitFlagsUseMillisecondValue",
+			statementTimeoutFlag:        "2ms",
+			expectedStatementTimeoutMS:  "2",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			cmd, getRuntimeParams := makeCommandAndParams(t)
+
+			databaseURL := makeBaseDatabaseURL(t)
+			if testCase.databaseURLStatementTimeout != "" {
+				queryValues := databaseURL.Query()
+				queryValues.Set("statement_timeout", testCase.databaseURLStatementTimeout)
+				databaseURL.RawQuery = queryValues.Encode()
+			}
+
+			args := []string{
+				"migrate-get", "--up", "--version", "1", "--database-url", databaseURL.String(),
+			}
+			if testCase.statementTimeoutFlag != "" {
+				args = append(args, "--statement-timeout", testCase.statementTimeoutFlag)
+			}
+			cmd.SetArgs(args)
+			require.NoError(t, cmd.Execute())
+
+			runtimeParams := getRuntimeParams()
+			require.NotNil(t, runtimeParams)
+
+			require.Equal(t, testCase.expectedStatementTimeoutMS, runtimeParams["statement_timeout"])
+		})
+	}
+}
+
+func TestBaseCommandSetDriverProcurerPgxV5(t *testing.T) {
+	t.Parallel()
+
+	calledStub := false
+
+	migratorStub := &MigratorStub{}
+	migratorStub.allVersionsStub = func() []rivermigrate.Migration { return []rivermigrate.Migration{testMigration01} }
+	migratorStub.getVersionStub = func(version int) (rivermigrate.Migration, error) {
+		calledStub = true
+		if version == 1 {
+			return testMigration01, nil
 		}
 
-		cmd.SetArgs([]string{"validate"})
-		require.NoError(t, cmd.Execute())
+		return rivermigrate.Migration{}, fmt.Errorf("unknown version: %d", version)
+	}
+	migratorStub.existingVersionsStub = func(ctx context.Context) ([]rivermigrate.Migration, error) { return nil, nil }
+
+	cli := NewCLI(&Config{
+		DriverProcurer: &DriverProcurerStub{
+			getMigratorStub: func(config *rivermigrate.Config) (MigratorInterface, error) {
+				calledStub = true
+				return migratorStub, nil
+			},
+			initPgxV5Stub: func(pool *pgxpool.Pool) {
+				calledStub = true
+			},
+		},
+		Name: "River",
+	})
+
+	var out bytes.Buffer
+	cli.SetOut(&out)
+
+	cmd := cli.BaseCommandSet()
+	cmd.SetArgs([]string{"migrate-get", "--up", "--version", "1"})
+	require.NoError(t, cmd.Execute())
+
+	require.True(t, calledStub)
+
+	require.Equal(t, strings.TrimSpace(`
+-- River main migration 001 [up]
+SELECT 'up 1' FROM river_table
+		`), strings.TrimSpace(out.String()))
+}
+
+func TestMigrateGet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	type testBundle struct {
+		migratorStub *MigratorStub
+		out          *bytes.Buffer
+	}
+
+	setup := func(t *testing.T) (*migrateGet, *testBundle) {
+		t.Helper()
+
+		cmd, out := withCommandBase(t, &migrateGet{})
+
+		migratorStub := &MigratorStub{}
+		migratorStub.allVersionsStub = func() []rivermigrate.Migration { return testMigrationAll }
+		migratorStub.getVersionStub = func(version int) (rivermigrate.Migration, error) {
+			switch version {
+			case 1:
+				return testMigration01, nil
+			case 2:
+				return testMigration02, nil
+			case 3:
+				return testMigration03, nil
+			}
+			return rivermigrate.Migration{}, fmt.Errorf("unknown version: %d", version)
+		}
+		migratorStub.existingVersionsStub = func(ctx context.Context) ([]rivermigrate.Migration, error) { return nil, nil }
+
+		cmd.GetCommandBase().DriverProcurer = &DriverProcurerStub{
+			getMigratorStub: func(config *rivermigrate.Config) (MigratorInterface, error) { return migratorStub, nil },
+		}
+
+		return cmd, &testBundle{
+			out:          out,
+			migratorStub: migratorStub,
+		}
+	}
+
+	t.Run("DownMigration", func(t *testing.T) {
+		t.Parallel()
+
+		cmd, bundle := setup(t)
+
+		_, err := runCommand(ctx, t, cmd, &migrateGetOpts{Down: true, Version: []int{1}})
+		require.NoError(t, err)
+
+		require.Equal(t, strings.TrimSpace(`
+-- River main migration 001 [down]
+SELECT 'down 1' FROM river_table
+		`), strings.TrimSpace(bundle.out.String()))
+	})
+
+	t.Run("UpMigration", func(t *testing.T) {
+		t.Parallel()
+
+		cmd, bundle := setup(t)
+
+		_, err := runCommand(ctx, t, cmd, &migrateGetOpts{Up: true, Version: []int{1}})
+		require.NoError(t, err)
+
+		require.Equal(t, strings.TrimSpace(`
+-- River main migration 001 [up]
+SELECT 'up 1' FROM river_table
+		`), strings.TrimSpace(bundle.out.String()))
+	})
+
+	t.Run("MultipleMigrations", func(t *testing.T) {
+		t.Parallel()
+
+		cmd, bundle := setup(t)
+
+		_, err := runCommand(ctx, t, cmd, &migrateGetOpts{Up: true, Version: []int{1, 2, 3}})
+		require.NoError(t, err)
+
+		require.Equal(t, strings.TrimSpace(`
+-- River main migration 001 [up]
+SELECT 'up 1' FROM river_table
+
+-- River main migration 002 [up]
+SELECT 'up 2' FROM river_table
+
+-- River main migration 003 [up]
+SELECT 'up 3' FROM river_table
+		`), strings.TrimSpace(bundle.out.String()))
+	})
+
+	t.Run("WithSchema", func(t *testing.T) {
+		t.Parallel()
+
+		cmd, bundle := setup(t)
+
+		_, err := runCommand(ctx, t, cmd, &migrateGetOpts{Schema: "custom_schema", Up: true, Version: []int{1}})
+		require.NoError(t, err)
+
+		require.Equal(t, strings.TrimSpace(`
+-- River main migration 001 [up]
+SELECT 'up 1' FROM custom_schema.river_table
+		`), strings.TrimSpace(bundle.out.String()))
 	})
 }
 
@@ -242,7 +569,9 @@ func TestMigrateList(t *testing.T) {
 		migratorStub.allVersionsStub = func() []rivermigrate.Migration { return testMigrationAll }
 		migratorStub.existingVersionsStub = func(ctx context.Context) ([]rivermigrate.Migration, error) { return nil, nil }
 
-		cmd.GetCommandBase().GetMigrator = func(config *rivermigrate.Config) (MigratorInterface, error) { return migratorStub, nil }
+		cmd.GetCommandBase().DriverProcurer = &DriverProcurerStub{
+			getMigratorStub: func(config *rivermigrate.Config) (MigratorInterface, error) { return migratorStub, nil },
+		}
 
 		return cmd, &testBundle{
 			out:          out,
@@ -314,8 +643,9 @@ func TestVersion(t *testing.T) {
 
 		buildInfo, _ := debug.ReadBuildInfo()
 
-		require.Equal(t, strings.TrimSpace(fmt.Sprintf(`
-River version (unknown)
+		// `devel` on 1.25, `unknown` on versions previous to that
+		require.Regexp(t, strings.TrimSpace(fmt.Sprintf(`
+River version \((devel|unknown)\)
 Built with %s
 		`, buildInfo.GoVersion)), strings.TrimSpace(bundle.buf.String()))
 	})
@@ -336,10 +666,9 @@ func withCommandBase[TCommand Command[TOpts], TOpts CommandOpts](t *testing.T, c
 
 	var out bytes.Buffer
 	cmd.SetCommandBase(&CommandBase{
-		Logger: riversharedtest.Logger(t),
-		Out:    &out,
-
-		GetMigrator: func(config *rivermigrate.Config) (MigratorInterface, error) { return &MigratorStub{}, nil },
+		DriverProcurer: &DriverProcurerStub{},
+		Logger:         riversharedtest.Logger(t),
+		Out:            &out,
 	})
 	return cmd, &out
 }
@@ -368,4 +697,16 @@ func TestRoundDuration(t *testing.T) {
 	require.Equal(t, "3.93s", roundDuration(mustParseDuration("3.937042s")).String())
 	require.Equal(t, "34.04s", roundDuration(mustParseDuration("34.042234s")).String())
 	require.Equal(t, "2m34.04s", roundDuration(mustParseDuration("2m34.042234s")).String())
+}
+
+func TestTargetVersion(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 1, targetVersionTranslateDefault(1))
+	require.Equal(t, 2, targetVersionTranslateDefault(2))
+	require.Equal(t, 3, targetVersionTranslateDefault(3))
+
+	require.Equal(t, 0, targetVersionTranslateDefault(-2))
+	require.Equal(t, -1, targetVersionTranslateDefault(-1))
+	require.Equal(t, -1, targetVersionTranslateDefault(0))
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/riverqueue/river/internal/dbunique"
 	"github.com/riverqueue/river/internal/hooklookup"
 	"github.com/riverqueue/river/internal/jobcompleter"
+	"github.com/riverqueue/river/internal/jobexecutor"
 	"github.com/riverqueue/river/internal/leadership"
 	"github.com/riverqueue/river/internal/maintenance"
 	"github.com/riverqueue/river/internal/middlewarelookup"
@@ -27,10 +28,12 @@ import (
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riverpilot"
+	"github.com/riverqueue/river/rivershared/riversharedmaintenance"
 	"github.com/riverqueue/river/rivershared/startstop"
-	"github.com/riverqueue/river/rivershared/testsignal"
+	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/maputil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -47,6 +50,20 @@ const (
 	PriorityDefault    = rivercommon.PriorityDefault
 	QueueDefault       = rivercommon.QueueDefault
 	QueueNumWorkersMax = 10_000
+)
+
+var (
+	postgresSchemaNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+	reindexerIndexNamesDefault = []string{ //nolint:gochecknoglobals
+		"river_job_args_index",
+		"river_job_kind",
+		"river_job_metadata_index",
+		"river_job_pkey",
+		"river_job_prioritized_fetching_index",
+		"river_job_state_and_finalized_at_index",
+		"river_job_unique_idx",
+	}
 )
 
 // TestConfig contains configuration specific to test environments.
@@ -93,17 +110,23 @@ type Config struct {
 	// CancelledJobRetentionPeriod is the amount of time to keep cancelled jobs
 	// around before they're removed permanently.
 	//
+	// The special value -1 disables deletion of cancelled jobs.
+	//
 	// Defaults to 24 hours.
 	CancelledJobRetentionPeriod time.Duration
 
 	// CompletedJobRetentionPeriod is the amount of time to keep completed jobs
 	// around before they're removed permanently.
 	//
+	// The special value -1 disables deletion of completed jobs.
+	//
 	// Defaults to 24 hours.
 	CompletedJobRetentionPeriod time.Duration
 
 	// DiscardedJobRetentionPeriod is the amount of time to keep discarded jobs
 	// around before they're removed permanently.
+	//
+	// The special value -1 disables deletion of discarded jobs.
 	//
 	// Defaults to 7 days.
 	DiscardedJobRetentionPeriod time.Duration
@@ -120,12 +143,16 @@ type Config struct {
 	//
 	// Throughput is limited by this value.
 	//
+	// Individual QueueConfig structs may override this for a specific queue.
+	//
 	// Defaults to 100 ms.
 	FetchCooldown time.Duration
 
 	// FetchPollInterval is the amount of time between periodic fetches for new
 	// jobs. Typically new jobs will be picked up ~immediately after insert via
 	// LISTEN/NOTIFY, but this provides a fallback.
+	//
+	// Individual QueueConfig structs may override this for a specific queue.
 	//
 	// Defaults to 1 second.
 	FetchPollInterval time.Duration
@@ -257,6 +284,18 @@ type Config struct {
 	// reindexer will run at midnight UTC every day.
 	ReindexerSchedule PeriodicSchedule
 
+	// ReindexerIndexNames customizes which indexes River periodically reindexes.
+	// If nil, River uses [ReindexerIndexNamesDefault]. If non-nil, the provided
+	// slice is used as the exact list.
+	ReindexerIndexNames []string
+
+	// ReindexerTimeout is the amount of time to wait for the reindexer to run a
+	// single reindex operation before cancelling it via context. Set to -1 to
+	// disable the timeout.
+	//
+	// Defaults to 1 minute.
+	ReindexerTimeout time.Duration
+
 	// RescueStuckJobsAfter is the amount of time a job can be running before it
 	// is considered stuck. A stuck job which has not yet reached its max attempts
 	// will be scheduled for a retry, while one which has exhausted its attempts
@@ -282,12 +321,21 @@ type Config struct {
 	// Defaults to DefaultRetryPolicy.
 	RetryPolicy ClientRetryPolicy
 
-	// schema is a non-standard schema where River tables are located. All table
+	// Schema is a non-standard Schema where River tables are located. All table
 	// references in database queries will use this value as a prefix.
 	//
 	// Defaults to empty, which causes the client to look for tables using the
 	// setting of Postgres `search_path`.
-	schema string
+	Schema string
+
+	// SkipJobKindValidation causes the job kind format validation check to be
+	// skipped. This is available as an interim stopgap for users that have
+	// invalid job kind names, but would rather disable the check rather than
+	// fix them immediately.
+	//
+	// Deprecated: This option will be removed in a future versions so that job
+	// kinds will always have to have a valid format.
+	SkipJobKindValidation bool
 
 	// SkipUnknownJobCheck is a flag to control whether the client should skip
 	// checking to see if a registered worker exists in the client's worker bundle
@@ -329,15 +377,38 @@ type Config struct {
 	// instances of rivertype.WorkerMiddleware).
 	WorkerMiddleware []rivertype.WorkerMiddleware
 
+	// queuePollInterval is the amount of time between periodic checks for queue
+	// setting changes. This is only used in poll-only mode (when no notifier is
+	// provided).
+	//
+	// This is internal for the time being as it hasn't had any major demand to
+	// be exposed, but it's needed to make sure that our poll-only tests can
+	// finish in a timely manner.
+	queuePollInterval time.Duration
+
 	// Scheduler run interval. Shared between the scheduler and producer/job
 	// executors, but not currently exposed for configuration.
 	schedulerInterval time.Duration
+}
+
+// ReindexerIndexNamesDefault returns the default set of indexes reindexed by River.
+func ReindexerIndexNamesDefault() []string {
+	indexNames := make([]string, len(reindexerIndexNamesDefault))
+	copy(indexNames, reindexerIndexNamesDefault)
+
+	return indexNames
 }
 
 // WithDefaults returns a copy of the Config with all default values applied.
 func (c *Config) WithDefaults() *Config {
 	if c == nil {
 		c = &Config{}
+	}
+
+	reindexerIndexNames := ReindexerIndexNamesDefault()
+	if c.ReindexerIndexNames != nil {
+		reindexerIndexNames = make([]string, len(c.ReindexerIndexNames))
+		copy(reindexerIndexNames, c.ReindexerIndexNames)
 	}
 
 	// Use the existing logger if set, otherwise create a default one.
@@ -364,44 +435,48 @@ func (c *Config) WithDefaults() *Config {
 
 	return &Config{
 		AdvisoryLockPrefix:          c.AdvisoryLockPrefix,
-		CancelledJobRetentionPeriod: valutil.ValOrDefault(c.CancelledJobRetentionPeriod, maintenance.CancelledJobRetentionPeriodDefault),
-		CompletedJobRetentionPeriod: valutil.ValOrDefault(c.CompletedJobRetentionPeriod, maintenance.CompletedJobRetentionPeriodDefault),
-		DiscardedJobRetentionPeriod: valutil.ValOrDefault(c.DiscardedJobRetentionPeriod, maintenance.DiscardedJobRetentionPeriodDefault),
+		CancelledJobRetentionPeriod: cmp.Or(c.CancelledJobRetentionPeriod, riversharedmaintenance.CancelledJobRetentionPeriodDefault),
+		CompletedJobRetentionPeriod: cmp.Or(c.CompletedJobRetentionPeriod, riversharedmaintenance.CompletedJobRetentionPeriodDefault),
+		DiscardedJobRetentionPeriod: cmp.Or(c.DiscardedJobRetentionPeriod, riversharedmaintenance.DiscardedJobRetentionPeriodDefault),
 		ErrorHandler:                c.ErrorHandler,
-		FetchCooldown:               valutil.ValOrDefault(c.FetchCooldown, FetchCooldownDefault),
-		FetchPollInterval:           valutil.ValOrDefault(c.FetchPollInterval, FetchPollIntervalDefault),
+		FetchCooldown:               cmp.Or(c.FetchCooldown, FetchCooldownDefault),
+		FetchPollInterval:           cmp.Or(c.FetchPollInterval, FetchPollIntervalDefault),
 		ID:                          valutil.ValOrDefaultFunc(c.ID, func() string { return defaultClientID(time.Now().UTC()) }),
 		Hooks:                       c.Hooks,
 		JobInsertMiddleware:         c.JobInsertMiddleware,
-		JobTimeout:                  valutil.ValOrDefault(c.JobTimeout, JobTimeoutDefault),
+		JobTimeout:                  cmp.Or(c.JobTimeout, JobTimeoutDefault),
 		Logger:                      logger,
-		MaxAttempts:                 valutil.ValOrDefault(c.MaxAttempts, MaxAttemptsDefault),
+		MaxAttempts:                 cmp.Or(c.MaxAttempts, MaxAttemptsDefault),
 		Middleware:                  c.Middleware,
 		PeriodicJobs:                c.PeriodicJobs,
 		PollOnly:                    c.PollOnly,
 		Queues:                      c.Queues,
+		ReindexerIndexNames:         reindexerIndexNames,
 		ReindexerSchedule:           c.ReindexerSchedule,
-		RescueStuckJobsAfter:        valutil.ValOrDefault(c.RescueStuckJobsAfter, rescueAfter),
+		ReindexerTimeout:            cmp.Or(c.ReindexerTimeout, maintenance.ReindexerTimeoutDefault),
+		RescueStuckJobsAfter:        cmp.Or(c.RescueStuckJobsAfter, rescueAfter),
 		RetryPolicy:                 retryPolicy,
-		schema:                      c.schema,
+		Schema:                      c.Schema,
+		SkipJobKindValidation:       c.SkipJobKindValidation,
 		SkipUnknownJobCheck:         c.SkipUnknownJobCheck,
 		Test:                        c.Test,
 		TestOnly:                    c.TestOnly,
 		WorkerMiddleware:            c.WorkerMiddleware,
 		Workers:                     c.Workers,
-		schedulerInterval:           valutil.ValOrDefault(c.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
+		queuePollInterval:           c.queuePollInterval,
+		schedulerInterval:           cmp.Or(c.schedulerInterval, maintenance.JobSchedulerIntervalDefault),
 	}
 }
 
 func (c *Config) validate() error {
-	if c.CancelledJobRetentionPeriod < 0 {
-		return errors.New("CancelledJobRetentionPeriod time cannot be less than zero")
+	if c.CancelledJobRetentionPeriod < -1 {
+		return errors.New("CancelledJobRetentionPeriod time cannot be less than zero, except for -1 (infinite)")
 	}
-	if c.CompletedJobRetentionPeriod < 0 {
-		return errors.New("CompletedJobRetentionPeriod cannot be less than zero")
+	if c.CompletedJobRetentionPeriod < -1 {
+		return errors.New("CompletedJobRetentionPeriod cannot be less than zero, except for -1 (infinite)")
 	}
-	if c.DiscardedJobRetentionPeriod < 0 {
-		return errors.New("DiscardedJobRetentionPeriod cannot be less than zero")
+	if c.DiscardedJobRetentionPeriod < -1 {
+		return errors.New("DiscardedJobRetentionPeriod cannot be less than zero, except for -1 (infinite)")
 	}
 	if c.FetchCooldown < FetchCooldownMin {
 		return fmt.Errorf("FetchCooldown must be at least %s", FetchCooldownMin)
@@ -424,6 +499,9 @@ func (c *Config) validate() error {
 	if len(c.Middleware) > 0 && (len(c.JobInsertMiddleware) > 0 || len(c.WorkerMiddleware) > 0) {
 		return errors.New("only one of the pair JobInsertMiddleware/WorkerMiddleware or Middleware may be provided (Middleware is recommended, and may contain both job insert and worker middleware)")
 	}
+	if c.ReindexerTimeout < -1 {
+		return errors.New("ReindexerTimeout cannot be negative, except for -1 (infinite)")
+	}
 	if c.RescueStuckJobsAfter < 0 {
 		return errors.New("RescueStuckJobsAfter cannot be less than zero")
 	}
@@ -431,14 +509,41 @@ func (c *Config) validate() error {
 		return errors.New("RescueStuckJobsAfter cannot be less than JobTimeout")
 	}
 
+	// Max Postgres notification topic length is 63 and we prefix schema to
+	// notification topic, so whatever schema the user specifies must fit inside
+	// this convention.
+	maxSchemaLength := 63 - 1 - len(string(notifier.NotificationTopicLongest)) // -1 for the dot in `<schema>.<topic>`
+	if len(c.Schema) > maxSchemaLength {
+		return fmt.Errorf("Schema length must be less than or equal to %d characters", maxSchemaLength)
+	}
+	if c.Schema != "" && !postgresSchemaNameRE.MatchString(c.Schema) {
+		return errors.New("Schema name can only contain letters, numbers, and underscores, and must start with a letter or underscore")
+	}
+
 	for queue, queueConfig := range c.Queues {
-		if err := queueConfig.validate(queue); err != nil {
+		if err := queueConfig.validate(queue, c.FetchCooldown, c.FetchPollInterval); err != nil {
 			return err
 		}
 	}
 
 	if c.Workers == nil && c.Queues != nil {
 		return errors.New("Workers must be set if Queues is set")
+	}
+
+	if c.Workers != nil {
+		for _, workerInfo := range c.Workers.workersMap {
+			kind := workerInfo.jobArgs.Kind()
+			if !rivercommon.UserSpecifiedIDOrKindRE.MatchString(kind) {
+				if c.SkipJobKindValidation {
+					c.Logger.Warn("job kind should match regex; this will be an error in future versions",
+						slog.String("kind", kind),
+						slog.String("regex", rivercommon.UserSpecifiedIDOrKindRE.String()),
+					)
+				} else {
+					return fmt.Errorf("job kind %q should match regex %s", kind, rivercommon.UserSpecifiedIDOrKindRE.String())
+				}
+			}
+		}
 	}
 
 	return nil
@@ -453,6 +558,25 @@ func (c *Config) willExecuteJobs() bool {
 
 // QueueConfig contains queue-specific configuration.
 type QueueConfig struct {
+	// FetchCooldown is the minimum amount of time to wait between fetches of new
+	// jobs. Jobs will only be fetched *at most* this often, but if no new jobs
+	// are coming in via LISTEN/NOTIFY then fetches may be delayed as long as
+	// FetchPollInterval.
+	//
+	// Throughput is limited by this value.
+	//
+	// If non-zero, this overrides the FetchCooldown setting in the Client's
+	// Config.
+	FetchCooldown time.Duration
+
+	// FetchPollInterval is the amount of time between periodic fetches for new
+	// jobs. Typically new jobs will be picked up ~immediately after insert via
+	// LISTEN/NOTIFY, but this provides a fallback.
+	//
+	// If non-zero, this overrides the FetchCooldown setting in the Client's
+	// Config.
+	FetchPollInterval time.Duration
+
 	// MaxWorkers is the maximum number of workers to run for the queue, or put
 	// otherwise, the maximum parallelism to run.
 	//
@@ -466,7 +590,20 @@ type QueueConfig struct {
 	MaxWorkers int
 }
 
-func (c QueueConfig) validate(queueName string) error {
+func (c QueueConfig) validate(queueName string, clientFetchCooldown time.Duration, clientFetchPollInterval time.Duration) error {
+	if c.FetchCooldown < 0 {
+		return errors.New("FetchCooldown cannot be less than zero")
+	}
+	if c.FetchPollInterval < 0 {
+		return errors.New("FetchPollInterval cannot be less than zero")
+	}
+
+	resolvedFetchCooldown := cmp.Or(c.FetchCooldown, clientFetchCooldown)
+	resolvedFetchPollInterval := cmp.Or(c.FetchPollInterval, clientFetchPollInterval)
+	if resolvedFetchPollInterval < resolvedFetchCooldown {
+		return errors.New("FetchPollInterval cannot be less than FetchCooldown")
+	}
+
 	if c.MaxWorkers < 1 || c.MaxWorkers > QueueNumWorkersMax {
 		return fmt.Errorf("invalid number of workers for queue %q: %d", queueName, c.MaxWorkers)
 	}
@@ -486,6 +623,7 @@ type Client[TTx any] struct {
 	baseService   baseservice.BaseService
 	baseStartStop startstop.BaseStartStop
 
+	clientNotifyBundle     *ClientNotifyBundle[TTx]
 	completer              jobcompleter.JobCompleter
 	config                 *Config
 	driver                 riverdriver.Driver[TTx]
@@ -499,6 +637,7 @@ type Client[TTx any] struct {
 	pilot                  riverpilot.Pilot
 	producersByQueueName   map[string]*producer
 	queueMaintainer        *maintenance.QueueMaintainer
+	queueMaintainerLeader  *maintenance.QueueMaintainerLeader
 	queues                 *QueueBundle
 	services               []startstop.Service
 	stopped                <-chan struct{}
@@ -512,36 +651,36 @@ type Client[TTx any] struct {
 
 // Test-only signals.
 type clientTestSignals struct {
-	electedLeader testsignal.TestSignal[struct{}] // notifies when elected leader
-
-	jobCleaner          *maintenance.JobCleanerTestSignals
-	jobRescuer          *maintenance.JobRescuerTestSignals
-	jobScheduler        *maintenance.JobSchedulerTestSignals
-	periodicJobEnqueuer *maintenance.PeriodicJobEnqueuerTestSignals
-	queueCleaner        *maintenance.QueueCleanerTestSignals
-	reindexer           *maintenance.ReindexerTestSignals
+	jobCleaner            *maintenance.JobCleanerTestSignals
+	jobRescuer            *maintenance.JobRescuerTestSignals
+	jobScheduler          *maintenance.JobSchedulerTestSignals
+	periodicJobEnqueuer   *maintenance.PeriodicJobEnqueuerTestSignals
+	queueCleaner          *maintenance.QueueCleanerTestSignals
+	queueMaintainerLeader *maintenance.QueueMaintainerLeaderTestSignals
+	reindexer             *maintenance.ReindexerTestSignals
 }
 
-func (ts *clientTestSignals) Init() {
-	ts.electedLeader.Init()
-
+func (ts *clientTestSignals) Init(tb testutil.TestingTB) {
 	if ts.jobCleaner != nil {
-		ts.jobCleaner.Init()
+		ts.jobCleaner.Init(tb)
 	}
 	if ts.jobRescuer != nil {
-		ts.jobRescuer.Init()
+		ts.jobRescuer.Init(tb)
 	}
 	if ts.jobScheduler != nil {
-		ts.jobScheduler.Init()
+		ts.jobScheduler.Init(tb)
 	}
 	if ts.periodicJobEnqueuer != nil {
-		ts.periodicJobEnqueuer.Init()
+		ts.periodicJobEnqueuer.Init(tb)
 	}
 	if ts.queueCleaner != nil {
-		ts.queueCleaner.Init()
+		ts.queueCleaner.Init(tb)
+	}
+	if ts.queueMaintainerLeader != nil {
+		ts.queueMaintainerLeader.Init(tb)
 	}
 	if ts.reindexer != nil {
-		ts.reindexer.Init()
+		ts.reindexer.Init(tb)
 	}
 }
 
@@ -613,6 +752,10 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 	}
 
 	client := &Client[TTx]{
+		clientNotifyBundle: &ClientNotifyBundle[TTx]{
+			config: config,
+			driver: driver,
+		},
 		config:               config,
 		driver:               driver,
 		hookLookupByJob:      hooklookup.NewJobHookLookup(),
@@ -622,7 +765,13 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		workCancel:           func(cause error) {}, // replaced on start, but here in case StopAndCancel is called before start up
 	}
 
-	client.queues = &QueueBundle{addProducer: client.addProducer, clientWillExecuteJobs: config.willExecuteJobs(), removeProducer: client.removeProducer}
+	client.queues = &QueueBundle{
+		addProducer:             client.addProducer,
+		clientFetchCooldown:     config.FetchCooldown,
+		clientFetchPollInterval: config.FetchPollInterval,
+		clientWillExecuteJobs:   config.willExecuteJobs(),
+		removeProducer:          client.removeProducer,
+	}
 
 	baseservice.Init(archetype, &client.baseService)
 	client.baseService.Name = "Client" // Have to correct the name because base service isn't embedded like it usually is
@@ -667,21 +816,46 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		pluginDriver.PluginInit(archetype)
 		client.pilot = pluginDriver.PluginPilot()
 	}
+
+	var workerMetadata []*rivertype.WorkerMetadata
+	if config.Workers != nil {
+		workerMetadata = make([]*rivertype.WorkerMetadata, 0, len(config.Workers.workersMap))
+		for kind, workerInfo := range config.Workers.workersMap {
+			var hooks []rivertype.Hook
+			if jobArgsWithHooks, ok := workerInfo.jobArgs.(JobArgsWithHooks); ok {
+				hooks = jobArgsWithHooks.Hooks()
+			}
+
+			workerMetadata = append(workerMetadata, &rivertype.WorkerMetadata{
+				JobArgHooks: hooks,
+				Kind:        kind,
+			})
+		}
+	}
+
 	if client.pilot == nil {
 		client.pilot = &riverpilot.StandardPilot{}
 	}
-	client.pilot.PilotInit(archetype)
+	client.pilot.PilotInit(archetype, (&riverpilot.PilotInitParams{
+		Insert:               client.insertMany,
+		NotifyNonTxJobInsert: client.notifyProducerWithoutListenerJobFetch,
+		WorkerMetadata:       workerMetadata,
+	}).Validate())
 	pluginPilot, _ := client.pilot.(pilotPlugin)
+
+	if withBaseService, ok := config.RetryPolicy.(baseservice.WithBaseService); ok {
+		baseservice.Init(archetype, withBaseService)
+	}
 
 	// There are a number of internal components that are only needed/desired if
 	// we're actually going to be working jobs (as opposed to just enqueueing
 	// them):
 	if config.willExecuteJobs() {
-		if !driver.HasPool() {
+		if !driver.PoolIsSet() {
 			return nil, errMissingDatabasePoolWithQueues
 		}
 
-		client.completer = jobcompleter.NewBatchCompleter(archetype, driver.GetExecutor(), client.pilot, nil)
+		client.completer = jobcompleter.NewBatchCompleter(archetype, config.Schema, driver.GetExecutor(), client.pilot, nil)
 		client.subscriptionManager = newSubscriptionManager(archetype, nil)
 		client.services = append(client.services, client.completer, client.subscriptionManager)
 
@@ -690,7 +864,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			// uses listen/notify. Instead, each service polls for changes it's
 			// interested in. e.g. Elector polls to see if leader has expired.
 			if !config.PollOnly {
-				client.notifier = notifier.New(archetype, driver.GetListener(config.schema))
+				client.notifier = notifier.New(archetype, driver.GetListener(&riverdriver.GetListenenerParams{Schema: config.Schema}))
 				client.services = append(client.services, client.notifier)
 			}
 		} else {
@@ -699,18 +873,18 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 
 		client.elector = leadership.NewElector(archetype, driver.GetExecutor(), client.notifier, &leadership.Config{
 			ClientID: config.ID,
+			Schema:   config.Schema,
 		})
 		client.services = append(client.services, client.elector)
 
 		for queue, queueConfig := range config.Queues {
-			client.addProducer(queue, queueConfig)
+			if _, err := client.addProducer(queue, queueConfig); err != nil {
+				return nil, err
+			}
 		}
 
 		client.services = append(client.services,
 			startstop.StartStopFunc(client.logStatsLoop))
-
-		client.services = append(client.services,
-			startstop.StartStopFunc(client.handleLeadershipChangeLoop))
 
 		if pluginPilot != nil {
 			client.services = append(client.services, pluginPilot.PluginServices()...)
@@ -727,7 +901,8 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 				CancelledJobRetentionPeriod: config.CancelledJobRetentionPeriod,
 				CompletedJobRetentionPeriod: config.CompletedJobRetentionPeriod,
 				DiscardedJobRetentionPeriod: config.DiscardedJobRetentionPeriod,
-				Schema:                      config.schema,
+				QueuesExcluded:              client.pilot.JobCleanerQueuesExcluded(),
+				Schema:                      config.Schema,
 				Timeout:                     config.JobCleanerTimeout,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobCleaner)
@@ -738,7 +913,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			jobRescuer := maintenance.NewRescuer(archetype, &maintenance.JobRescuerConfig{
 				ClientRetryPolicy: config.RetryPolicy,
 				RescueAfter:       config.RescueStuckJobsAfter,
-				Schema:            config.schema,
+				Schema:            config.Schema,
 				WorkUnitFactoryFunc: func(kind string) workunit.WorkUnitFactory {
 					if workerInfo, ok := config.Workers.workersMap[kind]; ok {
 						return workerInfo.workUnitFactory
@@ -754,17 +929,23 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			jobScheduler := maintenance.NewJobScheduler(archetype, &maintenance.JobSchedulerConfig{
 				Interval:     config.schedulerInterval,
 				NotifyInsert: client.maybeNotifyInsertForQueues,
-				Schema:       config.schema,
+				Schema:       config.Schema,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, jobScheduler)
 			client.testSignals.jobScheduler = &jobScheduler.TestSignals
 		}
 
 		{
-			periodicJobEnqueuer := maintenance.NewPeriodicJobEnqueuer(archetype, &maintenance.PeriodicJobEnqueuerConfig{
+			periodicJobEnqueuer, err := maintenance.NewPeriodicJobEnqueuer(archetype, &maintenance.PeriodicJobEnqueuerConfig{
 				AdvisoryLockPrefix: config.AdvisoryLockPrefix,
+				HookLookupGlobal:   client.hookLookupGlobal,
 				Insert:             client.insertMany,
+				Pilot:              client.pilot,
+				Schema:             config.Schema,
 			}, driver.GetExecutor())
+			if err != nil {
+				return nil, err
+			}
 			maintenanceServices = append(maintenanceServices, periodicJobEnqueuer)
 			client.testSignals.periodicJobEnqueuer = &periodicJobEnqueuer.TestSignals
 
@@ -775,7 +956,7 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		{
 			queueCleaner := maintenance.NewQueueCleaner(archetype, &maintenance.QueueCleanerConfig{
 				RetentionPeriod: maintenance.QueueRetentionPeriodDefault,
-				Schema:          config.schema,
+				Schema:          config.Schema,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, queueCleaner)
 			client.testSignals.queueCleaner = &queueCleaner.TestSignals
@@ -788,8 +969,10 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			}
 
 			reindexer := maintenance.NewReindexer(archetype, &maintenance.ReindexerConfig{
+				IndexNames:   config.ReindexerIndexNames,
 				ScheduleFunc: scheduleFunc,
-				Schema:       config.schema,
+				Schema:       config.Schema,
+				Timeout:      config.ReindexerTimeout,
 			}, driver.GetExecutor())
 			maintenanceServices = append(maintenanceServices, reindexer)
 			client.testSignals.reindexer = &reindexer.TestSignals
@@ -806,6 +989,15 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		if config.TestOnly {
 			client.queueMaintainer.StaggerStartupDisable(true)
 		}
+
+		client.queueMaintainerLeader = maintenance.NewQueueMaintainerLeader(archetype, &maintenance.QueueMaintainerLeaderConfig{
+			ClientID:          config.ID,
+			Elector:           client.elector,
+			QueueMaintainer:   client.queueMaintainer,
+			RequestResignFunc: client.clientNotifyBundle.RequestResign,
+		})
+		client.services = append(client.services, client.queueMaintainerLeader)
+		client.testSignals.queueMaintainerLeader = &client.queueMaintainerLeader.TestSignals
 	}
 
 	return client, nil
@@ -860,8 +1052,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		// available, the client appears to have started even though it's completely
 		// non-functional. Here we try to make an initial assessment of health and
 		// return quickly in case of an apparent problem.
-		_, err := c.driver.GetExecutor().Exec(fetchCtx, "SELECT 1")
-		if err != nil {
+		if err := c.driver.GetExecutor().Exec(fetchCtx, "SELECT 1"); err != nil {
 			return fmt.Errorf("error making initial connection to database: %w", err)
 		}
 
@@ -893,7 +1084,11 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		// We use separate contexts for fetching and working to allow for a graceful
 		// stop. Both inherit from the provided context, so if it's cancelled, a
 		// more aggressive stop will be initiated.
-		workCtx, workCancel := context.WithCancelCause(withClient(ctx, c))
+		workCtx, workCancel := context.WithCancelCause(ctx)
+
+		// Client available to executors and to various service hooks.
+		fetchCtx := withClient(fetchCtx, c)
+		workCtx = withClient(workCtx, c)
 
 		if err := startstop.StartAll(fetchCtx, c.services...); err != nil {
 			workCancel(err)
@@ -1007,11 +1202,11 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // more aggressive stop than Stop because the contexts for any in-progress jobs
 // are cancelled. However, it still waits for jobs to complete before returning,
 // even though their contexts are cancelled. If the provided context is done
-// before shutdown has completed, Stop will return immediately with the
+// before shutdown has completed, StopAndCancel will return immediately with the
 // context's error.
 //
-// This can also be initiated by cancelling the context passed to Run. There is
-// no need to call this method if the context passed to Run is cancelled
+// This can also be initiated by cancelling the context passed to Start. There is
+// no need to call this method if the context passed to Start is cancelled
 // instead.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	c.baseService.Logger.InfoContext(ctx, c.baseService.Name+": Hard stop started; cancelling all work")
@@ -1083,7 +1278,8 @@ type SubscribeConfig struct {
 	Kinds []EventKind
 }
 
-// Special internal variant that lets us inject an overridden size.
+// SubscribeConfig is a special internal variant of Subscribe that lets us
+// inject an overridden channel size.
 func (c *Client[TTx]) SubscribeConfig(config *SubscribeConfig) (<-chan *Event, func()) {
 	if c.subscriptionManager == nil {
 		panic("created a subscription on a client that will never work jobs (Queues not configured)")
@@ -1115,52 +1311,6 @@ func (c *Client[TTx]) logStatsLoop(ctx context.Context, shouldStart bool, starte
 
 			case <-ticker.C:
 				c.subscriptionManager.logStats(ctx, c.baseService.Name)
-			}
-		}
-	}()
-
-	return nil
-}
-
-func (c *Client[TTx]) handleLeadershipChangeLoop(ctx context.Context, shouldStart bool, started, stopped func()) error {
-	handleLeadershipChange := func(ctx context.Context, notification *leadership.Notification) {
-		c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": Election change received",
-			slog.String("client_id", c.config.ID), slog.Bool("is_leader", notification.IsLeader))
-
-		switch {
-		case notification.IsLeader:
-			// Starting the queue maintainer can take a little time so send to
-			// this test signal _first_ so tests waiting on it can finish,
-			// cancel the queue maintainer start, and overall run much faster.
-			c.testSignals.electedLeader.Signal(struct{}{})
-
-			if err := c.queueMaintainer.Start(ctx); err != nil {
-				c.baseService.Logger.ErrorContext(ctx, "Error starting queue maintainer", slog.String("err", err.Error()))
-			}
-
-		default:
-			c.queueMaintainer.Stop()
-		}
-	}
-
-	if !shouldStart {
-		return nil
-	}
-
-	go func() {
-		started()
-		defer stopped() // this defer should come first so it's last out
-
-		sub := c.elector.Listen()
-		defer sub.Unlisten()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case notification := <-sub.C():
-				handleLeadershipChange(ctx, notification)
 			}
 		}
 	}()
@@ -1212,7 +1362,18 @@ func (c *Client[TTx]) Driver() riverdriver.Driver[TTx] {
 // Returns the up-to-date JobRow for the specified jobID if it exists. Returns
 // ErrNotFound if the job doesn't exist.
 func (c *Client[TTx]) JobCancel(ctx context.Context, jobID int64) (*rivertype.JobRow, error) {
-	return c.jobCancel(ctx, c.driver.GetExecutor(), jobID)
+	job, err := c.jobCancel(ctx, c.driver.GetExecutor(), jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	c.notifyProducerWithoutListenerQueueControlEvent(job.Queue, &controlEventPayload{
+		Action: controlActionCancel,
+		JobID:  job.ID,
+		Queue:  job.Queue,
+	})
+
+	return job, nil
 }
 
 // JobCancelTx cancels the job with the given ID within the specified
@@ -1261,11 +1422,12 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, jobID int64) (*ri
 }
 
 func (c *Client[TTx]) jobCancel(ctx context.Context, exec riverdriver.Executor, jobID int64) (*rivertype.JobRow, error) {
-	return exec.JobCancel(ctx, &riverdriver.JobCancelParams{
+	return c.pilot.JobCancel(ctx, exec, &riverdriver.JobCancelParams{
 		ID:                jobID,
-		CancelAttemptedAt: c.baseService.Time.NowUTC(),
+		CancelAttemptedAt: c.baseService.Time.Now(),
 		ControlTopic:      string(notifier.NotificationTopicControl),
-		Schema:            c.config.schema,
+		Now:               c.baseService.Time.NowOrNil(),
+		Schema:            c.config.Schema,
 	})
 }
 
@@ -1275,11 +1437,11 @@ func (c *Client[TTx]) jobCancel(ctx context.Context, exec riverdriver.Executor, 
 func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRow, error) {
 	return c.driver.GetExecutor().JobDelete(ctx, &riverdriver.JobDeleteParams{
 		ID:     id,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
-// JobDelete deletes the job with the given ID from the database, returning the
+// JobDeleteTx deletes the job with the given ID from the database, returning the
 // deleted row if it was deleted. Jobs in the running state are not deleted,
 // instead returning rivertype.ErrJobRunning. This variant lets a caller retry a
 // job atomically alongside other database changes. A deleted job isn't deleted
@@ -1288,7 +1450,7 @@ func (c *Client[TTx]) JobDelete(ctx context.Context, id int64) (*rivertype.JobRo
 func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
 	return c.driver.UnwrapExecutor(tx).JobDelete(ctx, &riverdriver.JobDeleteParams{
 		ID:     id,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
@@ -1297,7 +1459,7 @@ func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id int64) (*river
 func (c *Client[TTx]) JobGet(ctx context.Context, id int64) (*rivertype.JobRow, error) {
 	return c.driver.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{
 		ID:     id,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
@@ -1307,7 +1469,7 @@ func (c *Client[TTx]) JobGet(ctx context.Context, id int64) (*rivertype.JobRow, 
 func (c *Client[TTx]) JobGetTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
 	return c.driver.UnwrapExecutor(tx).JobGetByID(ctx, &riverdriver.JobGetByIDParams{
 		ID:     id,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
@@ -1320,10 +1482,7 @@ func (c *Client[TTx]) JobGetTx(ctx context.Context, tx TTx, id int64) (*rivertyp
 // MaxAttempts is also incremented by one if the job has already exhausted its
 // max attempts.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.driver.GetExecutor().JobRetry(ctx, &riverdriver.JobRetryParams{
-		ID:     id,
-		Schema: c.config.schema,
-	})
+	return c.jobRetry(ctx, c.driver.GetExecutor(), id)
 }
 
 // JobRetryTx updates the job with the given ID to make it immediately available
@@ -1340,9 +1499,105 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow
 // MaxAttempts is also incremented by one if the job has already exhausted its
 // max attempts.
 func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.driver.UnwrapExecutor(tx).JobRetry(ctx, &riverdriver.JobRetryParams{
+	return c.jobRetry(ctx, c.driver.UnwrapExecutor(tx), id)
+}
+
+func (c *Client[TTx]) jobRetry(ctx context.Context, exec riverdriver.Executor, id int64) (*rivertype.JobRow, error) {
+	return c.pilot.JobRetry(ctx, exec, &riverdriver.JobRetryParams{
 		ID:     id,
-		Schema: c.config.schema,
+		Now:    c.baseService.Time.NowOrNil(),
+		Schema: c.config.Schema,
+	})
+}
+
+// JobUpdateParams contains parameters for Client.JobUpdate and Client.JobUpdateTx.
+type JobUpdateParams struct {
+	// Output is a new output value for a job.
+	//
+	// If not set, and a job is updated from inside a work function, the job's
+	// output is set based on output recorded so far using RecordOutput.
+	Output any
+}
+
+// JobUpdate updates the job with the given ID.
+//
+// If JobUpdateParams.Output is not set, this function may be used inside a job
+// work function to set a job's output based on output recorded so far using
+// RecordOutput.
+func (c *Client[TTx]) JobUpdate(ctx context.Context, id int64, params *JobUpdateParams) (*rivertype.JobRow, error) {
+	return c.jobUpdate(ctx, c.driver.GetExecutor(), id, params)
+}
+
+// JobUpdateTx updates the job with the given ID.
+//
+// If JobUpdateParams.Output is not set, this function may be used inside a job
+// work function to set a job's output based on output recorded so far using
+// RecordOutput.
+//
+// This variant updates the job inside of a transaction.
+func (c *Client[TTx]) JobUpdateTx(ctx context.Context, tx TTx, id int64, params *JobUpdateParams) (*rivertype.JobRow, error) {
+	return c.jobUpdate(ctx, c.driver.UnwrapExecutor(tx), id, params)
+}
+
+func (c *Client[TTx]) jobUpdate(ctx context.Context, exec riverdriver.Executor, id int64, params *JobUpdateParams) (*rivertype.JobRow, error) {
+	if params == nil {
+		params = &JobUpdateParams{}
+	}
+
+	outputFromWorkContext := func() json.RawMessage {
+		metadataUpdates, hasMetadataUpdates := jobexecutor.MetadataUpdatesFromWorkContext(ctx)
+		if !hasMetadataUpdates {
+			return nil
+		}
+
+		if val, ok := metadataUpdates[rivertype.MetadataKeyOutput]; ok {
+			return val.(json.RawMessage) //nolint:forcetypeassert
+		}
+
+		return nil
+	}()
+
+	var (
+		metadataDoMerge      bool
+		metadataUpdatesBytes = []byte("{}") // even in the event of no update, still valid jsonb
+	)
+	if outputFromWorkContext != nil || params.Output != nil {
+		metadataDoMerge = true
+
+		var outputBytes json.RawMessage
+
+		switch {
+		// comes first because params takes precedence over context output
+		case params.Output != nil:
+			var err error
+			outputBytes, err = json.Marshal(params.Output)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := checkOutputSize(outputBytes); err != nil {
+				return nil, err
+			}
+
+		case outputFromWorkContext != nil:
+			// no size check necessary here because it's already been checked in RecordOutput
+			outputBytes = outputFromWorkContext
+		}
+
+		var err error
+		metadataUpdatesBytes, err = json.Marshal(map[string]json.RawMessage{
+			rivertype.MetadataKeyOutput: outputBytes,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling metadata updates to JSON: %w", err)
+		}
+	}
+
+	return exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+		ID:              id,
+		MetadataDoMerge: metadataDoMerge,
+		Metadata:        metadataUpdatesBytes,
+		Schema:          c.config.Schema,
 	})
 }
 
@@ -1370,7 +1625,7 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	// If the time is stubbed (in a test), use that for `created_at`. Otherwise,
 	// leave an empty value which will either use the database's `now()` or be defaulted
 	// by drivers as necessary.
-	createdAt := archetype.Time.NowUTCOrNil()
+	createdAt := archetype.Time.NowOrNil()
 
 	maxAttempts := cmp.Or(insertOpts.MaxAttempts, jobInsertOpts.MaxAttempts, config.MaxAttempts)
 	priority := cmp.Or(insertOpts.Priority, jobInsertOpts.Priority, rivercommon.PriorityDefault)
@@ -1397,7 +1652,7 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 		}
 	}
 
-	if priority > 4 {
+	if priority < 1 || priority > 4 {
 		return nil, errors.New("priority must be between 1 and 4")
 	}
 
@@ -1471,25 +1726,20 @@ var errNoDriverDBPool = errors.New("driver must have non-nil database pool to us
 //		// handle error
 //	}
 func (c *Client[TTx]) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
-	if !c.driver.HasPool() {
+	if !c.driver.PoolIsSet() {
 		return nil, errNoDriverDBPool
 	}
 
-	tx, err := c.driver.GetExecutor().Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	inserted, err := c.insert(ctx, tx, args, opts)
+	res, err := dbutil.WithTxV(ctx, c.driver.GetExecutor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) ([]*rivertype.JobInsertResult, error) {
+		return c.validateParamsAndInsertMany(ctx, execTx, []InsertManyParams{{Args: args, InsertOpts: opts}})
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return inserted, nil
+	c.notifyProducerWithoutListenerJobFetch(ctx, res)
+
+	return res[0], nil
 }
 
 // InsertTx inserts a new job with the provided args on the given transaction.
@@ -1510,17 +1760,11 @@ func (c *Client[TTx]) Insert(ctx context.Context, args JobArgs, opts *InsertOpts
 // transactions, the job will not be worked until the transaction has committed,
 // and if the transaction rolls back, so too is the inserted job.
 func (c *Client[TTx]) InsertTx(ctx context.Context, tx TTx, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
-	return c.insert(ctx, c.driver.UnwrapExecutor(tx), args, opts)
-}
-
-func (c *Client[TTx]) insert(ctx context.Context, tx riverdriver.ExecutorTx, args JobArgs, opts *InsertOpts) (*rivertype.JobInsertResult, error) {
-	params := []InsertManyParams{{Args: args, InsertOpts: opts}}
-	results, err := c.validateParamsAndInsertMany(ctx, tx, params)
+	res, err := c.validateParamsAndInsertMany(ctx, c.driver.UnwrapExecutor(tx), []InsertManyParams{{Args: args, InsertOpts: opts}})
 	if err != nil {
 		return nil, err
 	}
-
-	return results[0], nil
+	return res[0], nil
 }
 
 // InsertManyParams encapsulates a single job combined with insert options for
@@ -1548,25 +1792,20 @@ type InsertManyParams struct {
 //		// handle error
 //	}
 func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
-	if !c.driver.HasPool() {
+	if !c.driver.PoolIsSet() {
 		return nil, errNoDriverDBPool
 	}
 
-	tx, err := c.driver.GetExecutor().Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	inserted, err := c.validateParamsAndInsertMany(ctx, tx, params)
+	res, err := dbutil.WithTxV(ctx, c.driver.GetExecutor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) ([]*rivertype.JobInsertResult, error) {
+		return c.validateParamsAndInsertMany(ctx, execTx, params)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return inserted, nil
+	c.notifyProducerWithoutListenerJobFetch(ctx, res)
+
+	return res, nil
 }
 
 // InsertManyTx inserts many jobs at once. Each job is inserted as an
@@ -1588,30 +1827,33 @@ func (c *Client[TTx]) InsertMany(ctx context.Context, params []InsertManyParams)
 // changes. An inserted job isn't visible to be worked until the transaction
 // commits, and if the transaction rolls back, so too is the inserted job.
 func (c *Client[TTx]) InsertManyTx(ctx context.Context, tx TTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
-	exec := c.driver.UnwrapExecutor(tx)
-	return c.validateParamsAndInsertMany(ctx, exec, params)
+	res, err := c.validateParamsAndInsertMany(ctx, c.driver.UnwrapExecutor(tx), params)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // validateParamsAndInsertMany is a helper method that wraps the insertMany
 // method to provide param validation and conversion prior to calling the actual
 // insertMany method. This allows insertMany to be reused by the
 // PeriodicJobEnqueuer which cannot reference top-level river package types.
-func (c *Client[TTx]) validateParamsAndInsertMany(ctx context.Context, tx riverdriver.ExecutorTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
+func (c *Client[TTx]) validateParamsAndInsertMany(ctx context.Context, execTx riverdriver.ExecutorTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
 	insertParams, err := c.insertManyParams(params)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.insertMany(ctx, tx, insertParams)
+	return c.insertMany(ctx, execTx, insertParams)
 }
 
 // insertMany is a shared code path for InsertMany and InsertManyTx, also used
 // by the PeriodicJobEnqueuer.
-func (c *Client[TTx]) insertMany(ctx context.Context, tx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
-	return c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
-		results, err := c.pilot.JobInsertMany(ctx, tx, &riverdriver.JobInsertFastManyParams{
+func (c *Client[TTx]) insertMany(ctx context.Context, execTx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
+	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
+		results, err := c.pilot.JobInsertMany(ctx, execTx, &riverdriver.JobInsertFastManyParams{
 			Jobs:   insertParams,
-			Schema: c.config.schema,
+			Schema: c.config.Schema,
 		})
 		if err != nil {
 			return nil, err
@@ -1650,9 +1892,10 @@ func (c *Client[TTx]) insertManyShared(
 		finalInsertParams := sliceutil.Map(insertParams, func(params *rivertype.JobInsertParams) *riverdriver.JobInsertFastParams {
 			return (*riverdriver.JobInsertFastParams)(params)
 		})
-		results, err := execute(ctx, finalInsertParams)
+
+		insertResults, err := execute(ctx, finalInsertParams)
 		if err != nil {
-			return results, err
+			return insertResults, err
 		}
 
 		queues := make([]string, 0, 10)
@@ -1661,10 +1904,12 @@ func (c *Client[TTx]) insertManyShared(
 				queues = append(queues, params.Queue)
 			}
 		}
-		if err := c.maybeNotifyInsertForQueues(ctx, tx, queues); err != nil {
+
+		if err = c.maybeNotifyInsertForQueues(ctx, tx, queues); err != nil {
 			return nil, err
 		}
-		return results, nil
+
+		return insertResults, nil
 	}
 
 	jobInsertMiddleware := c.middlewareLookupGlobal.ByMiddlewareKind(middlewarelookup.MiddlewareKindJobInsert)
@@ -1707,6 +1952,42 @@ func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*rivertype.
 	return insertParams, nil
 }
 
+// Notifies an internal producer of new jobs being queued for work.  Only
+// invoked if the client's driver doesn't support a listener. If a listener is
+// supported, job notifications go out via listen/notify instead.
+//
+// Should only ever be invoked *outside* a transaction. If invoked within a
+// transaction, the producer wouldn't yet be able to access the new jobs that
+// triggered the notification because they're not committed yet.
+func (c *Client[TTx]) notifyProducerWithoutListenerJobFetch(_ context.Context, res []*rivertype.JobInsertResult) {
+	if c.driver.SupportsListener() || len(c.producersByQueueName) < 1 {
+		return
+	}
+
+	// Special case for when we were handling exactly one job, which is a very
+	// common case. Acts as a minor optimization by avoiding the map allocation.
+	if len(res) == 1 {
+		if producer, ok := c.producersByQueueName[res[0].Job.Queue]; ok {
+			producer.TriggerJobFetch()
+		}
+
+		return
+	}
+
+	queuesTriggered := make(map[string]struct{})
+
+	for _, insertRes := range res {
+		if _, ok := queuesTriggered[insertRes.Job.Queue]; ok {
+			continue
+		}
+		queuesTriggered[insertRes.Job.Queue] = struct{}{}
+
+		if producer, ok := c.producersByQueueName[insertRes.Job.Queue]; ok {
+			producer.TriggerJobFetch()
+		}
+	}
+}
+
 // InsertManyFast inserts many jobs at once using Postgres' `COPY FROM` mechanism,
 // making the operation quite fast and memory efficient. Each job is inserted as
 // an InsertManyParams tuple, which takes job args along with an optional set of
@@ -1726,31 +2007,27 @@ func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*rivertype.
 // Unlike with `InsertMany`, unique conflicts cannot be handled gracefully. If a
 // unique constraint is violated, the operation will fail and no jobs will be inserted.
 func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyParams) (int, error) {
-	if !c.driver.HasPool() {
+	if !c.driver.PoolIsSet() {
 		return 0, errNoDriverDBPool
 	}
 
 	// Wrap in a transaction in case we need to notify about inserts.
-	tx, err := c.driver.GetExecutor().Begin(ctx)
+	res, err := dbutil.WithTxV(ctx, c.driver.GetExecutor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) ([]*rivertype.JobInsertResult, error) {
+		return c.insertManyFast(ctx, execTx, params)
+	})
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(ctx)
 
-	inserted, err := c.insertManyFast(ctx, tx, params)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return inserted, nil
+	c.notifyProducerWithoutListenerJobFetch(ctx, res)
+
+	return len(res), nil
 }
 
-// InsertManyTx inserts many jobs at once using Postgres' `COPY FROM` mechanism,
-// making the operation quite fast and memory efficient. Each job is inserted as
-// an InsertManyParams tuple, which takes job args along with an optional set of
-// insert options, which override insert options provided by an
+// InsertManyFastTx inserts many jobs at once using Postgres' `COPY FROM`
+// mechanism, making the operation quite fast and memory efficient. Each job is
+// inserted as an InsertManyParams tuple, which takes job args along with an
+// optional set of insert options, which override insert options provided by an
 // JobArgsWithInsertOpts.InsertOpts implementation or any client-level defaults.
 // The provided context is used for the underlying Postgres inserts and can be
 // used to cancel the operation or apply a timeout.
@@ -1771,31 +2048,29 @@ func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyPar
 // a unique constraint is violated, the operation will fail and no jobs will be
 // inserted.
 func (c *Client[TTx]) InsertManyFastTx(ctx context.Context, tx TTx, params []InsertManyParams) (int, error) {
-	exec := c.driver.UnwrapExecutor(tx)
-	return c.insertManyFast(ctx, exec, params)
-}
-
-func (c *Client[TTx]) insertManyFast(ctx context.Context, tx riverdriver.ExecutorTx, params []InsertManyParams) (int, error) {
-	insertParams, err := c.insertManyParams(params)
+	res, err := c.insertManyFast(ctx, c.driver.UnwrapExecutor(tx), params)
 	if err != nil {
 		return 0, err
 	}
+	return len(res), nil
+}
 
-	results, err := c.insertManyShared(ctx, tx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
-		count, err := tx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+func (c *Client[TTx]) insertManyFast(ctx context.Context, execTx riverdriver.ExecutorTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
+	insertParams, err := c.insertManyParams(params)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
+		count, err := execTx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
 			Jobs:   insertParams,
-			Schema: c.config.schema,
+			Schema: c.config.Schema,
 		})
 		if err != nil {
 			return nil, err
 		}
 		return make([]*rivertype.JobInsertResult, count), nil
 	})
-	if err != nil {
-		return 0, err
-	}
-
-	return len(results), nil
 }
 
 // Notify the given queues that new jobs are available. The queues list will be
@@ -1806,19 +2081,16 @@ func (c *Client[TTx]) maybeNotifyInsertForQueues(ctx context.Context, tx riverdr
 		return nil
 	}
 
-	queueMap := make(map[string]struct{})
-	queuesDeduped := make([]string, 0, len(queues))
-	payloads := make([]string, 0, len(queues))
+	var (
+		queuesDeduped   = sliceutil.Uniq(queues)
+		payloads        = make([]string, 0, len(queuesDeduped))
+		queuesTriggered = make([]string, 0, len(queuesDeduped))
+	)
 
-	for _, queue := range queues {
-		if _, ok := queueMap[queue]; ok {
-			continue
-		}
-
-		queueMap[queue] = struct{}{}
+	for _, queue := range queuesDeduped {
 		if c.insertNotifyLimiter.ShouldTrigger(queue) {
 			payloads = append(payloads, fmt.Sprintf("{\"queue\": %q}", queue))
-			queuesDeduped = append(queuesDeduped, queue)
+			queuesTriggered = append(queuesTriggered, queue)
 		}
 	}
 
@@ -1826,25 +2098,28 @@ func (c *Client[TTx]) maybeNotifyInsertForQueues(ctx context.Context, tx riverdr
 		return nil
 	}
 
-	err := tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
-		Payload: payloads,
-		Schema:  c.config.schema,
-		Topic:   string(notifier.NotificationTopicInsert),
-	})
-	if err != nil {
-		c.baseService.Logger.ErrorContext(
-			ctx,
-			c.baseService.Name+": Failed to send job insert notification",
-			slog.String("queues", strings.Join(queuesDeduped, ",")),
-			slog.String("err", err.Error()),
-		)
-		return err
+	if c.driver.SupportsListenNotify() {
+		err := tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
+			Payload: payloads,
+			Schema:  c.config.Schema,
+			Topic:   string(notifier.NotificationTopicInsert),
+		})
+		if err != nil {
+			c.baseService.Logger.ErrorContext(
+				ctx,
+				c.baseService.Name+": Failed to send job insert notification",
+				slog.String("queues", strings.Join(queuesTriggered, ",")),
+				slog.String("err", err.Error()),
+			)
+			return err
+		}
 	}
+
 	return nil
 }
 
 // emit a notification about a queue being paused or resumed.
-func (c *Client[TTx]) notifyQueuePauseOrResume(ctx context.Context, tx riverdriver.ExecutorTx, action controlAction, queue string, opts *QueuePauseOpts) error {
+func (c *Client[TTx]) notifyQueuePauseOrResume(ctx context.Context, tx riverdriver.ExecutorTx, action controlAction, queue string, opts *QueuePauseOpts) (*controlEventPayload, error) {
 	c.baseService.Logger.DebugContext(ctx,
 		c.baseService.Name+": Notifying about queue state change",
 		slog.String("action", string(action)),
@@ -1852,25 +2127,30 @@ func (c *Client[TTx]) notifyQueuePauseOrResume(ctx context.Context, tx riverdriv
 		slog.String("opts", fmt.Sprintf("%+v", opts)),
 	)
 
-	payload, err := json.Marshal(controlEventPayload{Action: action, Queue: queue})
+	controlEvent := &controlEventPayload{Action: action, Queue: queue}
+
+	payload, err := json.Marshal(controlEvent)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	err = tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
-		Payload: []string{string(payload)},
-		Schema:  c.config.schema,
-		Topic:   string(notifier.NotificationTopicControl),
-	})
-	if err != nil {
-		c.baseService.Logger.ErrorContext(
-			ctx,
-			c.baseService.Name+": Failed to send queue state change notification",
-			slog.String("err", err.Error()),
-		)
-		return err
+	if c.driver.SupportsListenNotify() {
+		err = tx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
+			Payload: []string{string(payload)},
+			Schema:  c.config.Schema,
+			Topic:   string(notifier.NotificationTopicControl),
+		})
+		if err != nil {
+			c.baseService.Logger.ErrorContext(
+				ctx,
+				c.baseService.Name+": Failed to send queue state change notification",
+				slog.String("err", err.Error()),
+			)
+			return nil, err
+		}
 	}
-	return nil
+
+	return controlEvent, nil
 }
 
 // Validates job args prior to insertion. Currently, verifies that a worker to
@@ -1889,13 +2169,17 @@ func (c *Client[TTx]) validateJobArgs(args JobArgs) error {
 	return nil
 }
 
-func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) *producer {
+func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) (*producer, error) {
+	if _, alreadyExists := c.producersByQueueName[queueName]; alreadyExists {
+		return nil, &QueueAlreadyAddedError{Name: queueName}
+	}
+
 	producer := newProducer(&c.baseService.Archetype, c.driver.GetExecutor(), c.pilot, &producerConfig{
 		ClientID:                     c.config.ID,
 		Completer:                    c.completer,
 		ErrorHandler:                 c.config.ErrorHandler,
-		FetchCooldown:                c.config.FetchCooldown,
-		FetchPollInterval:            c.config.FetchPollInterval,
+		FetchCooldown:                cmp.Or(queueConfig.FetchCooldown, c.config.FetchCooldown),
+		FetchPollInterval:            cmp.Or(queueConfig.FetchPollInterval, c.config.FetchPollInterval),
 		HookLookupByJob:              c.hookLookupByJob,
 		HookLookupGlobal:             c.hookLookupGlobal,
 		JobTimeout:                   c.config.JobTimeout,
@@ -1904,14 +2188,15 @@ func (c *Client[TTx]) addProducer(queueName string, queueConfig QueueConfig) *pr
 		Notifier:                     c.notifier,
 		Queue:                        queueName,
 		QueueEventCallback:           c.subscriptionManager.distributeQueueEvent,
+		QueuePollInterval:            c.config.queuePollInterval,
 		RetryPolicy:                  c.config.RetryPolicy,
 		SchedulerInterval:            c.config.schedulerInterval,
-		Schema:                       c.config.schema,
+		Schema:                       c.config.Schema,
 		StaleProducerRetentionPeriod: 5 * time.Minute,
 		Workers:                      c.config.Workers,
 	})
 	c.producersByQueueName[queueName] = producer
-	return producer
+	return producer, nil
 }
 
 func (c *Client[TTx]) removeProducer(queueName string) {
@@ -1940,6 +2225,64 @@ func validateQueueName(queueName string) error {
 	return nil
 }
 
+// JobDeleteManyResult is the result of a job list operation. It contains a list of
+// jobs and a cursor for fetching the next page of results.
+type JobDeleteManyResult struct {
+	// Jobs is a slice of job returned as part of the list operation.
+	Jobs []*rivertype.JobRow
+}
+
+// JobDeleteMany deletes many jobs at once based on the conditions defined by
+// JobDeleteManyParams. Running jobs are always ignored.
+//
+//	params := river.NewJobDeleteManyParams().First(10).State(rivertype.JobStateCompleted)
+//	jobRows, err := client.JobDeleteMany(ctx, params)
+//	if err != nil {
+//		// handle error
+//	}
+func (c *Client[TTx]) JobDeleteMany(ctx context.Context, params *JobDeleteManyParams) (*JobDeleteManyResult, error) {
+	if !c.driver.PoolIsSet() {
+		return nil, errNoDriverDBPool
+	}
+
+	return c.jobDeleteMany(ctx, c.driver.GetExecutor(), params)
+}
+
+// JobDeleteManyTx deletes many jobs at once based on the conditions defined by
+// JobDeleteManyParams. Running jobs are always ignored.
+//
+//	params := river.NewJobDeleteManyParams().First(10).States(river.JobStateCompleted)
+//	jobRows, err := client.JobDeleteManyTx(ctx, tx, params)
+//	if err != nil {
+//		// handle error
+//	}
+func (c *Client[TTx]) JobDeleteManyTx(ctx context.Context, tx TTx, params *JobDeleteManyParams) (*JobDeleteManyResult, error) {
+	return c.jobDeleteMany(ctx, c.driver.UnwrapExecutor(tx), params)
+}
+
+func (c *Client[TTx]) jobDeleteMany(ctx context.Context, exec riverdriver.Executor, params *JobDeleteManyParams) (*JobDeleteManyResult, error) {
+	if params == nil {
+		params = NewJobDeleteManyParams()
+	}
+	params.schema = c.config.Schema
+
+	if params.filtersEmpty() && !params.unsafeAll {
+		return nil, errors.New("delete with no filters not allowed to prevent accidental deletion of all jobs; either specify a predicate (e.g. JobDeleteManyParams.IDs, JobDeleteManyParams.Kinds, ...) or call JobDeleteManyParams.All")
+	}
+
+	listParams, err := dblist.JobMakeDriverParams(ctx, params.toDBParams(), c.driver.SQLFragmentColumnIn)
+	if err != nil {
+		return nil, err
+	}
+
+	jobs, err := exec.JobDeleteMany(ctx, (*riverdriver.JobDeleteManyParams)(listParams))
+	if err != nil {
+		return nil, err
+	}
+
+	return &JobDeleteManyResult{Jobs: jobs}, nil
+}
+
 // JobListResult is the result of a job list operation. It contains a list of
 // jobs and a cursor for fetching the next page of results.
 type JobListResult struct {
@@ -1949,6 +2292,10 @@ type JobListResult struct {
 	// LastCursor is a cursor that can be used to list the next page of jobs.
 	LastCursor *JobListCursor
 }
+
+const databaseNameSQLite = "sqlite"
+
+var errJobListParamsMetadataNotSupportedSQLite = errors.New("JobListParams.Metadata is not supported on SQLite")
 
 // JobList returns a paginated list of jobs matching the provided filters. The
 // provided context is used for the underlying Postgres query and can be used to
@@ -1960,22 +2307,34 @@ type JobListResult struct {
 //		// handle error
 //	}
 func (c *Client[TTx]) JobList(ctx context.Context, params *JobListParams) (*JobListResult, error) {
-	if !c.driver.HasPool() {
+	if !c.driver.PoolIsSet() {
 		return nil, errNoDriverDBPool
 	}
 
 	if params == nil {
 		params = NewJobListParams()
 	}
+	params.schema = c.config.Schema
+
+	if c.driver.DatabaseName() == databaseNameSQLite && params.metadataCalled {
+		return nil, errJobListParamsMetadataNotSupportedSQLite
+	}
+
 	dbParams, err := params.toDBParams()
 	if err != nil {
 		return nil, err
 	}
 
-	jobs, err := dblist.JobList(ctx, c.driver.GetExecutor(), dbParams)
+	listParams, err := dblist.JobMakeDriverParams(ctx, dbParams, c.driver.SQLFragmentColumnIn)
 	if err != nil {
 		return nil, err
 	}
+
+	jobs, err := c.driver.GetExecutor().JobList(ctx, listParams)
+	if err != nil {
+		return nil, err
+	}
+
 	res := &JobListResult{Jobs: jobs}
 	if len(jobs) > 0 {
 		res.LastCursor = jobListCursorFromJobAndParams(jobs[len(jobs)-1], params)
@@ -1996,16 +2355,27 @@ func (c *Client[TTx]) JobListTx(ctx context.Context, tx TTx, params *JobListPara
 	if params == nil {
 		params = NewJobListParams()
 	}
+	params.schema = c.config.Schema
+
+	if c.driver.DatabaseName() == databaseNameSQLite && params.metadataCalled {
+		return nil, errJobListParamsMetadataNotSupportedSQLite
+	}
 
 	dbParams, err := params.toDBParams()
 	if err != nil {
 		return nil, err
 	}
 
-	jobs, err := dblist.JobList(ctx, c.driver.UnwrapExecutor(tx), dbParams)
+	listParams, err := dblist.JobMakeDriverParams(ctx, dbParams, c.driver.SQLFragmentColumnIn)
 	if err != nil {
 		return nil, err
 	}
+
+	jobs, err := c.driver.UnwrapExecutor(tx).JobList(ctx, listParams)
+	if err != nil {
+		return nil, err
+	}
+
 	res := &JobListResult{Jobs: jobs}
 	if len(jobs) > 0 {
 		res.LastCursor = jobListCursorFromJobAndParams(jobs[len(jobs)-1], params)
@@ -2013,11 +2383,74 @@ func (c *Client[TTx]) JobListTx(ctx context.Context, tx TTx, params *JobListPara
 	return res, nil
 }
 
-// PeriodicJobs returns the currently configured set of periodic jobs for the
-// client, and can be used to add new ones or remove existing ones.
-func (c *Client[TTx]) PeriodicJobs() *PeriodicJobBundle { return c.periodicJobs }
+// Notify retrieves a notification bundle for the client (in the sense of
+// Postgres listen/notify) used to send notifications of various kinds.
+func (c *Client[TTx]) Notify() *ClientNotifyBundle[TTx] {
+	return c.clientNotifyBundle
+}
 
-// Driver exposes the underlying pilot used by the client.
+// ClientNotifyBundle sends various notifications for a client (in the sense of
+// Postgres listen/notify). Functions are on this bundle struct instead of the
+// top-level client to keep them grouped together and better organized.
+type ClientNotifyBundle[TTx any] struct {
+	config *Config
+	driver riverdriver.Driver[TTx]
+}
+
+// RequestResign sends a notification requesting that the current leader resign.
+// This usually causes the resignation of the current leader, but may have no
+// effect if no leader is currently elected.
+func (c *ClientNotifyBundle[TTx]) RequestResign(ctx context.Context) error {
+	return dbutil.WithTx(ctx, c.driver.GetExecutor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) error {
+		return c.requestResignTx(ctx, execTx)
+	})
+}
+
+// RequestResignTx sends a notification requesting that the current leader
+// resign. This usually causes the resignation of the current leader, but may
+// have no effect if no leader is currently elected.
+//
+// This variant sends a notification in a transaction, which means that no
+// notification is sent until the transaction commits.
+func (c *ClientNotifyBundle[TTx]) RequestResignTx(ctx context.Context, tx TTx) error {
+	return c.requestResignTx(ctx, c.driver.UnwrapExecutor(tx))
+}
+
+// notifyExecTx is a shared helper between Notify and NotifyTx that sends a
+// notification.
+func (c *ClientNotifyBundle[TTx]) requestResignTx(ctx context.Context, execTx riverdriver.ExecutorTx) error {
+	payloadStr, err := json.Marshal(&leadership.DBNotification{
+		Action: leadership.DBNotificationKindRequestResign,
+	})
+	if err != nil {
+		return err
+	}
+
+	return execTx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
+		Payload: []string{string(payloadStr)},
+		Schema:  c.config.Schema,
+		Topic:   string(notifier.NotificationTopicLeadership),
+	})
+}
+
+// PeriodicJobs returns the currently configured set of periodic jobs for the
+// client, and can be used to add new or remove existing ones.
+//
+// This function should only be invoked on clients capable of running perioidc
+// jobs. Running periodic jobs requires that the client be electable as leader
+// to run maintenance services, and being electable as leader requires that a
+// client be started. To be startable, a client must have Queues and Workers
+// configured. Invoking this function will panic if these conditions aren't met.
+func (c *Client[TTx]) PeriodicJobs() *PeriodicJobBundle {
+	if !c.config.willExecuteJobs() {
+		panic("client Queues and Workers must be configured to modify periodic jobs (otherwise, they'll have no effect because a client not configured to work jobs can't be started)")
+	}
+
+	return c.periodicJobs
+}
+
+// Pilot returns the pilot in use by the pilot. If not configured, this is often
+// simply StandardPilot.
 //
 // API is not stable. DO NOT USE.
 func (c *Client[TTx]) Pilot() riverpilot.Pilot {
@@ -2036,7 +2469,7 @@ func (c *Client[TTx]) Queues() *QueueBundle { return c.queues }
 func (c *Client[TTx]) QueueGet(ctx context.Context, name string) (*rivertype.Queue, error) {
 	return c.driver.GetExecutor().QueueGet(ctx, &riverdriver.QueueGetParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
@@ -2048,7 +2481,7 @@ func (c *Client[TTx]) QueueGet(ctx context.Context, name string) (*rivertype.Que
 func (c *Client[TTx]) QueueGetTx(ctx context.Context, tx TTx, name string) (*rivertype.Queue, error) {
 	return c.driver.UnwrapExecutor(tx).QueueGet(ctx, &riverdriver.QueueGetParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Schema: c.config.Schema,
 	})
 }
 
@@ -2076,8 +2509,8 @@ func (c *Client[TTx]) QueueList(ctx context.Context, params *QueueListParams) (*
 	}
 
 	queues, err := c.driver.GetExecutor().QueueList(ctx, &riverdriver.QueueListParams{
-		Limit:  int(params.paginationCount),
-		Schema: c.config.schema,
+		Max:    int(params.paginationCount),
+		Schema: c.config.Schema,
 	})
 	if err != nil {
 		return nil, err
@@ -2103,8 +2536,8 @@ func (c *Client[TTx]) QueueListTx(ctx context.Context, tx TTx, params *QueueList
 	}
 
 	queues, err := c.driver.UnwrapExecutor(tx).QueueList(ctx, &riverdriver.QueueListParams{
-		Limit:  int(params.paginationCount),
-		Schema: c.config.schema,
+		Max:    int(params.paginationCount),
+		Schema: c.config.Schema,
 	})
 	if err != nil {
 		return nil, err
@@ -2129,20 +2562,28 @@ func (c *Client[TTx]) QueuePause(ctx context.Context, name string, opts *QueuePa
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer dbutil.RollbackWithoutCancel(ctx, tx)
 
 	if err := tx.QueuePause(ctx, &riverdriver.QueuePauseParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Now:    c.baseService.Time.NowOrNil(),
+		Schema: c.config.Schema,
 	}); err != nil {
 		return err
 	}
 
-	if err := c.notifyQueuePauseOrResume(ctx, tx, controlActionPause, name, opts); err != nil {
+	controlEvent, err := c.notifyQueuePauseOrResume(ctx, tx, controlActionPause, name, opts)
+	if err != nil {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+
+	return nil
 }
 
 // QueuePauseTx pauses the queue with the given name. When a queue is paused,
@@ -2161,12 +2602,13 @@ func (c *Client[TTx]) QueuePauseTx(ctx context.Context, tx TTx, name string, opt
 
 	if err := executorTx.QueuePause(ctx, &riverdriver.QueuePauseParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Now:    c.baseService.Time.NowOrNil(),
+		Schema: c.config.Schema,
 	}); err != nil {
 		return err
 	}
 
-	if err := c.notifyQueuePauseOrResume(ctx, executorTx, controlActionPause, name, opts); err != nil {
+	if _, err := c.notifyQueuePauseOrResume(ctx, executorTx, controlActionPause, name, opts); err != nil {
 		return err
 	}
 
@@ -2190,23 +2632,31 @@ func (c *Client[TTx]) QueueResume(ctx context.Context, name string, opts *QueueP
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer dbutil.RollbackWithoutCancel(ctx, tx)
 
 	if err := tx.QueueResume(ctx, &riverdriver.QueueResumeParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Now:    c.baseService.Time.NowOrNil(),
+		Schema: c.config.Schema,
 	}); err != nil {
 		return err
 	}
 
-	if err := c.notifyQueuePauseOrResume(ctx, tx, controlActionResume, name, opts); err != nil {
+	controlEvent, err := c.notifyQueuePauseOrResume(ctx, tx, controlActionResume, name, opts)
+	if err != nil {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+
+	return nil
 }
 
-// QueueResume resumes the queue with the given name. If the queue was
+// QueueResumeTx resumes the queue with the given name. If the queue was
 // previously paused, any clients configured to work that queue will resume
 // fetching additional jobs. To resume all queues at once, use the special queue
 // name "*".
@@ -2223,12 +2673,13 @@ func (c *Client[TTx]) QueueResumeTx(ctx context.Context, tx TTx, name string, op
 
 	if err := executorTx.QueueResume(ctx, &riverdriver.QueueResumeParams{
 		Name:   name,
-		Schema: c.config.schema,
+		Now:    c.baseService.Time.NowOrNil(),
+		Schema: c.config.Schema,
 	}); err != nil {
 		return err
 	}
 
-	if err := c.notifyQueuePauseOrResume(ctx, executorTx, controlActionResume, name, opts); err != nil {
+	if _, err := c.notifyQueuePauseOrResume(ctx, executorTx, controlActionResume, name, opts); err != nil {
 		return err
 	}
 
@@ -2249,9 +2700,9 @@ func (c *Client[TTx]) QueueUpdate(ctx context.Context, name string, params *Queu
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer dbutil.RollbackWithoutCancel(ctx, tx)
 
-	queue, err := c.queueUpdate(ctx, tx, name, params)
+	queue, controlEvent, err := c.queueUpdate(ctx, tx, name, params)
 	if err != nil {
 		return nil, err
 	}
@@ -2260,56 +2711,90 @@ func (c *Client[TTx]) QueueUpdate(ctx context.Context, name string, params *Queu
 		return nil, err
 	}
 
+	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+
 	return queue, nil
 }
 
 // QueueUpdateTx updates a queue's settings in the database. These settings
 // override the settings in the client (if applied).
 func (c *Client[TTx]) QueueUpdateTx(ctx context.Context, tx TTx, name string, params *QueueUpdateParams) (*rivertype.Queue, error) {
-	executorTx := c.driver.UnwrapExecutor(tx)
-
-	return c.queueUpdate(ctx, executorTx, name, params)
+	queue, _, err := c.queueUpdate(ctx, c.driver.UnwrapExecutor(tx), name, params)
+	if err != nil {
+		return nil, err
+	}
+	return queue, nil
 }
 
-func (c *Client[TTx]) queueUpdate(ctx context.Context, executorTx riverdriver.ExecutorTx, name string, params *QueueUpdateParams) (*rivertype.Queue, error) {
+// Notifies an internal producer of a queue control event like pause/resume.
+// Only invoked if the client's driver doesn't support a listener. If a listener
+// is supported, control events go out via listen/notify instead.
+//
+// Should only ever be invoked *outside* a transaction. If invoked within a
+// transaction, the producer wouldn't yet be able to access the state that
+// triggered the notification because it's not committed yet.
+func (c *Client[TTx]) notifyProducerWithoutListenerQueueControlEvent(queue string, controlEvent *controlEventPayload) {
+	if c.driver.SupportsListener() || len(c.producersByQueueName) < 1 {
+		return
+	}
+
+	if producer, ok := c.producersByQueueName[queue]; ok {
+		producer.TriggerQueueControlEvent(controlEvent)
+	}
+}
+
+func (c *Client[TTx]) queueUpdate(ctx context.Context, executorTx riverdriver.ExecutorTx, name string, params *QueueUpdateParams) (*rivertype.Queue, *controlEventPayload, error) {
 	updateMetadata := len(params.Metadata) > 0
 
 	queue, err := executorTx.QueueUpdate(ctx, &riverdriver.QueueUpdateParams{
 		Metadata:         params.Metadata,
 		MetadataDoUpdate: updateMetadata,
 		Name:             name,
+		Schema:           c.config.Schema,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if updateMetadata {
-		payload, err := json.Marshal(controlEventPayload{
-			Action:   controlActionMetadataChanged,
-			Metadata: params.Metadata,
-			Queue:    queue.Name,
-		})
-		if err != nil {
-			return nil, err
-		}
+	if !updateMetadata {
+		return queue, nil, err
+	}
 
+	controlEvent := &controlEventPayload{
+		Action:   controlActionMetadataChanged,
+		Metadata: params.Metadata,
+		Queue:    queue.Name,
+	}
+
+	payload, err := json.Marshal(controlEvent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if c.driver.SupportsListenNotify() {
 		if err := executorTx.NotifyMany(ctx, &riverdriver.NotifyManyParams{
 			Payload: []string{string(payload)},
-			Schema:  c.config.schema,
+			Schema:  c.config.Schema,
 			Topic:   string(notifier.NotificationTopicControl),
 		}); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	return queue, nil
+	return queue, controlEvent, nil
 }
+
+// Schema returns the configured schema for the client.
+func (c *Client[TTx]) Schema() string { return c.config.Schema }
 
 // QueueBundle is a bundle for adding additional queues. It's made accessible
 // through Client.Queues.
 type QueueBundle struct {
 	// Function that adds a producer to the associated client.
-	addProducer func(queueName string, queueConfig QueueConfig) *producer
+	addProducer func(queueName string, queueConfig QueueConfig) (*producer, error)
+
+	clientFetchCooldown     time.Duration
+	clientFetchPollInterval time.Duration
 
 	removeProducer        func(queueName string)
 	clientWillExecuteJobs bool
@@ -2327,22 +2812,22 @@ type QueueBundle struct {
 // Add adds a new queue to the client. If the client is already started, a
 // producer for the queue is started. Context is inherited from the one given to
 // Client.Start.
-//
-// TODO: there is no way for this to work at runtime using a separate pro queue
-// config, unless we put pro configs like concurrency within QueueConfig.
 func (b *QueueBundle) Add(queueName string, queueConfig QueueConfig) error {
 	if !b.clientWillExecuteJobs {
 		return errors.New("client is not configured to execute jobs, cannot add queue")
 	}
 
-	if err := queueConfig.validate(queueName); err != nil {
+	if err := queueConfig.validate(queueName, b.clientFetchCooldown, b.clientFetchPollInterval); err != nil {
 		return err
 	}
 
 	b.startStopMu.Lock()
 	defer b.startStopMu.Unlock()
 
-	producer := b.addProducer(queueName, queueConfig)
+	producer, err := b.addProducer(queueName, queueConfig)
+	if err != nil {
+		return err
+	}
 
 	// Start the queue if the client is already started.
 	if b.fetchCtx != nil && b.fetchCtx.Err() == nil {

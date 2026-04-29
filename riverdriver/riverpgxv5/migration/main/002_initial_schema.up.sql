@@ -18,7 +18,7 @@ CREATE TABLE /* TEMPLATE: schema */river_job(
   -- looking at jobs with `SELECT *` it'll appear first after ID. The other two
   -- fields aren't as important but are kept adjacent to `state` for alignment
   -- to get an 8-byte block.
-  state river_job_state NOT NULL DEFAULT 'available',
+  state /* TEMPLATE: schema */river_job_state NOT NULL DEFAULT 'available',
   attempt smallint NOT NULL DEFAULT 0,
   max_attempts smallint NOT NULL,
 
@@ -83,14 +83,14 @@ CREATE TRIGGER river_notify
   EXECUTE PROCEDURE /* TEMPLATE: schema */river_job_notify();
 
 CREATE UNLOGGED TABLE /* TEMPLATE: schema */river_leader(
-  -- 8 bytes each (no alignment needed)
-  elected_at timestamptz NOT NULL,
-  expires_at timestamptz NOT NULL,
+    -- 8 bytes each (no alignment needed)
+    elected_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
 
-  -- types stored out-of-band
-  leader_id text NOT NULL,
-  name text PRIMARY KEY,
+    -- types stored out-of-band
+    leader_id text NOT NULL,
+    name text PRIMARY KEY,
 
-  CONSTRAINT name_length CHECK (char_length(name) > 0 AND char_length(name) < 128),
-  CONSTRAINT leader_id_length CHECK (char_length(leader_id) > 0 AND char_length(leader_id) < 128)
+    CONSTRAINT name_length CHECK (char_length(name) > 0 AND char_length(name) < 128),
+    CONSTRAINT leader_id_length CHECK (char_length(leader_id) > 0 AND char_length(leader_id) < 128)
 );

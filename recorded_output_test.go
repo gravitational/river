@@ -10,8 +10,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 )
 
 func Test_RecordedOutput(t *testing.T) {
@@ -19,7 +21,7 @@ func Test_RecordedOutput(t *testing.T) {
 	ctx := context.Background()
 
 	type JobArgs struct {
-		JobArgsReflectKind[JobArgs]
+		testutil.JobArgsReflectKind[JobArgs]
 	}
 
 	type myOutput struct {
@@ -28,16 +30,26 @@ func Test_RecordedOutput(t *testing.T) {
 
 	type testBundle struct {
 		dbPool *pgxpool.Pool
+		schema string
 	}
 
 	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
 		t.Helper()
 
-		dbPool := riverinternaltest.TestDB(ctx, t)
-		config := newTestConfig(t, nil)
-		client := newTestClient(t, dbPool, config)
+		var (
+			dbPool = riversharedtest.DBPool(ctx, t)
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+			config = newTestConfig(t, schema)
+			client = newTestClient(t, dbPool, config)
+		)
+
 		t.Cleanup(func() { require.NoError(t, client.Stop(ctx)) })
-		return client, &testBundle{dbPool: dbPool}
+
+		return client, &testBundle{
+			dbPool: dbPool,
+			schema: schema,
+		}
 	}
 
 	t.Run("ValidOutput", func(t *testing.T) {
@@ -133,7 +145,7 @@ func Test_RecordedOutput(t *testing.T) {
 
 		AddWorker(client.config.Workers, WorkFunc(func(ctx context.Context, job *Job[JobArgs]) error {
 			// Record an output of 32MB + 1 byte:
-			err := RecordOutput(ctx, strings.Repeat("x", 32*1024*1024+1))
+			err := RecordOutput(ctx, strings.Repeat("x", maxOutputSizeBytes+1))
 			require.ErrorContains(t, err, "output is too large")
 			return err
 		}))

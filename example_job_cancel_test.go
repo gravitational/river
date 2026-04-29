@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/util/slogutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 )
 
 type CancellingArgs struct {
@@ -37,26 +40,22 @@ func (w *CancellingWorker) Work(ctx context.Context, job *river.Job[CancellingAr
 func Example_jobCancel() { //nolint:dupl
 	ctx := context.Background()
 
-	dbPool, err := pgxpool.NewWithConfig(ctx, riverinternaltest.DatabaseConfig("river_test_example"))
+	dbPool, err := pgxpool.New(ctx, riversharedtest.TestDatabaseURL())
 	if err != nil {
 		panic(err)
 	}
 	defer dbPool.Close()
 
-	// Required for the purpose of this test, but not necessary in real usage.
-	if err := riverinternaltest.TruncateRiverTables(ctx, dbPool); err != nil {
-		panic(err)
-	}
-
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &CancellingWorker{})
 
 	riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
-		Logger: slog.New(&slogutil.SlogMessageOnlyHandler{Level: slog.LevelWarn}),
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn, ReplaceAttr: slogutil.NoLevelTime})),
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 10},
 		},
-		TestOnly: true, // suitable only for use in tests; remove for live environments
+		Schema:   riverdbtest.TestSchema(ctx, testutil.PanicTB(), riverpgxv5.New(dbPool), nil), // only necessary for the example test
+		TestOnly: true,                                                                         // suitable only for use in tests; remove for live environments
 		Workers:  workers,
 	})
 	if err != nil {
@@ -73,7 +72,8 @@ func Example_jobCancel() { //nolint:dupl
 	if _, err = riverClient.Insert(ctx, CancellingArgs{ShouldCancel: true}, nil); err != nil {
 		panic(err)
 	}
-	waitForNJobs(subscribeChan, 1)
+	// Wait for jobs to complete. Only needed for purposes of the example test.
+	riversharedtest.WaitOrTimeoutN(testutil.PanicTB(), subscribeChan, 1)
 
 	if err := riverClient.Stop(ctx); err != nil {
 		panic(err)

@@ -3,6 +3,7 @@ package dblist
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/riverqueue/river/riverdriver"
@@ -24,18 +25,35 @@ type JobListOrderBy struct {
 }
 
 type JobListParams struct {
-	Conditions string
+	IDs        []int64
 	Kinds      []string
 	LimitCount int32
-	NamedArgs  map[string]any
 	OrderBy    []JobListOrderBy
 	Priorities []int16
 	Queues     []string
+	Schema     string
 	States     []rivertype.JobState
+	Where      []WherePredicate
 }
 
-func JobList(ctx context.Context, exec riverdriver.Executor, params *JobListParams) ([]*rivertype.JobRow, error) {
-	var whereBuilder strings.Builder
+type WherePredicate struct {
+	NamedArgs map[string]any
+	SQL       string
+}
+
+// JobMakeDriverParams converts client-level parameters for job and delete to
+// driver-level parameters for use with an executor, which generally goes by
+// converting typed fields for IDs, kinds, queues, etc. to lower-level SQL.
+//
+// This was originally implemented for listing jobs, but since the logic is so
+// similar, it also performs the same function for JobDeleteMany. This works
+// because `riverdriver.JobListParams` is identical to `JobDeleteMany` and
+// therefore pointer-level converts to it.
+func JobMakeDriverParams(ctx context.Context, params *JobListParams, sqlFragmentColumnIn func(column string, values any) (string, any, error)) (*riverdriver.JobListParams, error) {
+	var (
+		namedArgs    = make(map[string]any)
+		whereBuilder strings.Builder
+	)
 
 	orderBy := make([]JobListOrderBy, len(params.OrderBy))
 	for i, o := range params.OrderBy {
@@ -43,11 +61,6 @@ func JobList(ctx context.Context, exec riverdriver.Executor, params *JobListPara
 			Expr:  o.Expr,
 			Order: o.Order,
 		}
-	}
-
-	namedArgs := params.NamedArgs
-	if namedArgs == nil {
-		namedArgs = make(map[string]any)
 	}
 
 	// Writes an `AND` to connect SQL predicates as long as this isn't the first
@@ -58,33 +71,89 @@ func JobList(ctx context.Context, exec riverdriver.Executor, params *JobListPara
 		}
 	}
 
+	if len(params.IDs) > 0 {
+		writeAndAfterFirst()
+
+		const column = "id"
+		sqlFragment, arg, err := sqlFragmentColumnIn(column, params.IDs)
+		if err != nil {
+			return nil, fmt.Errorf("error building SQL fragment for %q: %w", column, err)
+		}
+		whereBuilder.WriteString(sqlFragment)
+		namedArgs[column] = arg
+	}
+
 	if len(params.Kinds) > 0 {
 		writeAndAfterFirst()
-		whereBuilder.WriteString("kind = any(@kinds::text[])")
-		namedArgs["kinds"] = params.Kinds
+
+		const column = "kind"
+		sqlFragment, arg, err := sqlFragmentColumnIn(column, params.Kinds)
+		if err != nil {
+			return nil, fmt.Errorf("error building SQL fragment for %q: %w", column, err)
+		}
+		whereBuilder.WriteString(sqlFragment)
+		namedArgs[column] = arg
+	}
+
+	if len(params.Priorities) > 0 {
+		writeAndAfterFirst()
+
+		const column = "priority"
+		sqlFragment, arg, err := sqlFragmentColumnIn(column, params.Priorities)
+		if err != nil {
+			return nil, fmt.Errorf("error building SQL fragment for %q: %w", column, err)
+		}
+		whereBuilder.WriteString(sqlFragment)
+		namedArgs[column] = arg
 	}
 
 	if len(params.Queues) > 0 {
 		writeAndAfterFirst()
-		whereBuilder.WriteString("queue = any(@queues::text[])")
-		namedArgs["queues"] = params.Queues
+
+		const column = "queue"
+		sqlFragment, arg, err := sqlFragmentColumnIn(column, params.Queues)
+		if err != nil {
+			return nil, fmt.Errorf("error building SQL fragment for %q: %w", column, err)
+		}
+		whereBuilder.WriteString(sqlFragment)
+		namedArgs[column] = arg
 	}
 
 	if len(params.States) > 0 {
 		writeAndAfterFirst()
-		whereBuilder.WriteString("state = any(@states::river_job_state[])")
-		namedArgs["states"] = sliceutil.Map(params.States, func(s rivertype.JobState) string { return string(s) })
+
+		const column = "state"
+		sqlFragment, arg, err := sqlFragmentColumnIn(column,
+			sliceutil.Map(params.States, func(v rivertype.JobState) string { return string(v) }))
+		if err != nil {
+			return nil, fmt.Errorf("error building SQL fragment for %q: %w", column, err)
+		}
+		whereBuilder.WriteString(sqlFragment)
+		namedArgs[column] = arg
 	}
 
-	if params.Conditions != "" {
+	for _, where := range params.Where {
 		writeAndAfterFirst()
-		whereBuilder.WriteString(params.Conditions)
+
+		whereBuilder.WriteString(where.SQL)
+		for name, val := range where.NamedArgs {
+			expectedSymbol := "@" + name
+			if !strings.Contains(where.SQL, expectedSymbol) {
+				return nil, fmt.Errorf("expected %q to contain named arg symbol %s", where.SQL, expectedSymbol)
+			}
+
+			if _, ok := namedArgs[name]; ok {
+				return nil, fmt.Errorf("named argument %s already registered", expectedSymbol)
+			}
+
+			namedArgs[name] = val
+		}
 	}
 
 	// A condition of some kind is needed, so given no others write one that'll
 	// always return true.
 	if whereBuilder.Len() < 1 {
-		whereBuilder.WriteString("1")
+		whereBuilder.WriteString("true")
 	}
 
 	if params.LimitCount < 1 {
@@ -112,10 +181,11 @@ func JobList(ctx context.Context, exec riverdriver.Executor, params *JobListPara
 		}
 	}
 
-	return exec.JobList(ctx, &riverdriver.JobListParams{
+	return &riverdriver.JobListParams{
 		Max:           params.LimitCount,
 		NamedArgs:     namedArgs,
 		OrderByClause: orderByBuilder.String(),
+		Schema:        params.Schema,
 		WhereClause:   whereBuilder.String(),
-	})
+	}, nil
 }

@@ -123,14 +123,12 @@ func testService(t *testing.T, newService func(t *testing.T) serviceWithStopped)
 		var wg sync.WaitGroup
 
 		for range 10 {
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				for range 50 {
 					require.NoError(t, service.Start(ctx))
 					service.Stop()
 				}
-				wg.Done()
-			}()
+			})
 		}
 
 		wg.Wait()
@@ -254,6 +252,32 @@ func TestSampleService(t *testing.T) {
 
 		riversharedtest.WaitOrTimeout(t, service.Started()) // start channel also closed on erroneous start
 		riversharedtest.WaitOrTimeout(t, service.Stopped())
+	})
+
+	t.Run("StartErrorThenSuccessfulRestart", func(t *testing.T) {
+		t.Parallel()
+
+		service, _ := setup(t)
+		service.startErr = errors.New("error on start")
+
+		// First start fails with our simulated error.
+		require.ErrorIs(t, service.Start(ctx), service.startErr)
+
+		riversharedtest.WaitOrTimeout(t, service.Started())
+		riversharedtest.WaitOrTimeout(t, service.Stopped())
+
+		// Clear error so the next start succeeds.
+		service.startErr = nil
+
+		// Second start should succeed despite the prior failure. Without the
+		// reset-on-failed-start logic in StartInit, isRunning would still be
+		// true and StartInit would return shouldStart=false, causing Start to
+		// return nil without actually starting the service.
+		require.NoError(t, service.Start(ctx))
+		t.Cleanup(service.Stop)
+
+		riversharedtest.WaitOrTimeout(t, service.Started())
+		require.True(t, service.state)
 	})
 }
 

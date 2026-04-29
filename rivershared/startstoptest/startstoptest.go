@@ -23,7 +23,7 @@ func Stress(ctx context.Context, tb testingT, svc startstop.Service) {
 // tolerated on start (either no error or an error that is allowedStartErr is
 // allowed). This is useful for services that may want to return an error if
 // they're shut down as they're still starting up.
-func StressErr(ctx context.Context, tb testingT, svc startstop.Service, allowedStartErr error) { //nolint:varnamelen
+func StressErr(ctx context.Context, tb testingT, svc startstop.Service, allowedStartErr error) {
 	tb.Helper()
 
 	var wg sync.WaitGroup
@@ -48,10 +48,7 @@ func StressErr(ctx context.Context, tb testingT, svc startstop.Service, allowedS
 	}
 
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for range 50 {
 				err := svc.Start(ctx)
 				if err != nil && !isAllowedStartError(err) {
@@ -71,7 +68,7 @@ func StressErr(ctx context.Context, tb testingT, svc startstop.Service, allowedS
 					require.FailNow(tb, "Timed out waiting for service to stop")
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -80,7 +77,7 @@ func StressErr(ctx context.Context, tb testingT, svc startstop.Service, allowedS
 // Minimal interface for *testing.B/*testing.T that lets us test a failure
 // condition for our test helpers above.
 type testingT interface {
-	Errorf(format string, args ...interface{})
+	Errorf(format string, args ...any)
 	FailNow()
 	Helper()
 }

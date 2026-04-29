@@ -1,12 +1,12 @@
 module github.com/riverqueue/river/riverdriver
 
-go 1.23.0
+go 1.25.0
 
-toolchain go1.24.1
+toolchain go1.25.7
 
 require (
-	github.com/riverqueue/river/rivertype v0.20.2
-	github.com/stretchr/testify v1.10.0
+	github.com/riverqueue/river/rivertype v0.35.1
+	github.com/stretchr/testify v1.11.1
 )
 
 require (

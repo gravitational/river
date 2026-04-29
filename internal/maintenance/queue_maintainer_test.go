@@ -8,19 +8,21 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
 	"github.com/riverqueue/river/internal/riverinternaltest/sharedtx"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/baseservice"
+	"github.com/riverqueue/river/rivershared/riversharedmaintenance"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/startstoptest"
 	"github.com/riverqueue/river/rivershared/testsignal"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivertype"
 )
 
 type testService struct {
-	queueMaintainerServiceBase
+	riversharedmaintenance.QueueMaintainerServiceBase
 	startstop.BaseStartStop
 
 	testSignals testServiceTestSignals
@@ -30,7 +32,7 @@ func newTestService(tb testing.TB) *testService {
 	tb.Helper()
 
 	testSvc := baseservice.Init(riversharedtest.BaseServiceArchetype(tb), &testService{})
-	testSvc.testSignals.Init()
+	testSvc.testSignals.Init(tb)
 
 	return testSvc
 }
@@ -58,9 +60,9 @@ type testServiceTestSignals struct {
 	started   testsignal.TestSignal[struct{}]
 }
 
-func (ts *testServiceTestSignals) Init() {
-	ts.returning.Init()
-	ts.started.Init()
+func (ts *testServiceTestSignals) Init(tb testutil.TestingTB) {
+	ts.returning.Init(tb)
+	ts.started.Init(tb)
 }
 
 func TestQueueMaintainer(t *testing.T) {
@@ -92,7 +94,7 @@ func TestQueueMaintainer(t *testing.T) {
 	t.Run("StartStopStress", func(t *testing.T) {
 		t.Parallel()
 
-		tx := riverinternaltest.TestTx(ctx, t)
+		tx := riverdbtest.TestTxPgx(ctx, t)
 		sharedTx := sharedtx.NewSharedTx(tx)
 
 		archetype := riversharedtest.BaseServiceArchetype(t)
@@ -100,20 +102,23 @@ func TestQueueMaintainer(t *testing.T) {
 
 		driver := riverpgxv5.New(nil).UnwrapExecutor(sharedTx)
 
+		periodicJobEnqueuer, err := NewPeriodicJobEnqueuer(archetype, &PeriodicJobEnqueuerConfig{
+			PeriodicJobs: []*PeriodicJob{
+				{
+					ConstructorFunc: func() (*rivertype.JobInsertParams, error) {
+						return nil, ErrNoJobToInsert
+					},
+					ScheduleFunc: cron.Every(15 * time.Minute).Next,
+				},
+			},
+		}, driver)
+		require.NoError(t, err)
+
 		// Use realistic services in this one so we can verify stress not only
 		// on the queue maintainer, but it and all its subservices together.
 		maintainer := setup(t, []startstop.Service{
 			NewJobCleaner(archetype, &JobCleanerConfig{}, driver),
-			NewPeriodicJobEnqueuer(archetype, &PeriodicJobEnqueuerConfig{
-				PeriodicJobs: []*PeriodicJob{
-					{
-						ConstructorFunc: func() (*rivertype.JobInsertParams, error) {
-							return nil, ErrNoJobToInsert
-						},
-						ScheduleFunc: cron.Every(15 * time.Minute).Next,
-					},
-				},
-			}, driver),
+			periodicJobEnqueuer,
 			NewQueueCleaner(archetype, &QueueCleanerConfig{}, driver),
 			NewJobScheduler(archetype, &JobSchedulerConfig{}, driver),
 		})

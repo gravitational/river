@@ -9,13 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/riverqueue/river/internal/dbunique"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivershared/riversharedmaintenance"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/startstoptest"
 	"github.com/riverqueue/river/rivershared/testfactory"
+	"github.com/riverqueue/river/rivershared/uniquestates"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -30,13 +31,18 @@ func TestJobScheduler(t *testing.T) {
 		notificationsByQueue map[string]int
 	}
 
-	setup := func(t *testing.T, exec riverdriver.Executor) (*JobScheduler, *testBundle) {
+	type testOpts struct {
+		exec   riverdriver.Executor
+		schema string // for use when using a non-TestTx
+	}
+
+	setup := func(t *testing.T, opts *testOpts) (*JobScheduler, *testBundle) {
 		t.Helper()
 
 		archetype := riversharedtest.BaseServiceArchetype(t)
 
 		bundle := &testBundle{
-			exec:                 exec,
+			exec:                 opts.exec,
 			notificationsByQueue: make(map[string]int),
 		}
 
@@ -44,16 +50,16 @@ func TestJobScheduler(t *testing.T) {
 			archetype,
 			&JobSchedulerConfig{
 				Interval: JobSchedulerIntervalDefault,
-				Limit:    10,
 				NotifyInsert: func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error {
 					for _, queue := range queues {
 						bundle.notificationsByQueue[queue]++
 					}
 					return nil
 				},
+				Schema: opts.schema,
 			},
 			bundle.exec)
-		scheduler.TestSignals.Init()
+		scheduler.TestSignals.Init(t)
 		t.Cleanup(scheduler.Stop)
 
 		return scheduler, bundle
@@ -61,8 +67,8 @@ func TestJobScheduler(t *testing.T) {
 
 	setupTx := func(t *testing.T) (*JobScheduler, *testBundle) {
 		t.Helper()
-		tx := riverinternaltest.TestTx(ctx, t)
-		return setup(t, riverpgxv5.New(nil).UnwrapExecutor(tx))
+		tx := riverdbtest.TestTxPgx(ctx, t)
+		return setup(t, &testOpts{exec: riverpgxv5.New(nil).UnwrapExecutor(tx)})
 	}
 
 	requireJobStateUnchanged := func(t *testing.T, scheduler *JobScheduler, exec riverdriver.Executor, job *rivertype.JobRow) *rivertype.JobRow {
@@ -95,7 +101,8 @@ func TestJobScheduler(t *testing.T) {
 		scheduler := NewJobScheduler(riversharedtest.BaseServiceArchetype(t), &JobSchedulerConfig{}, nil)
 
 		require.Equal(t, JobSchedulerIntervalDefault, scheduler.config.Interval)
-		require.Equal(t, JobSchedulerLimitDefault, scheduler.config.Limit)
+		require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.config.Default)
+		require.Equal(t, riversharedmaintenance.BatchSizeReduced, scheduler.config.Reduced)
 	})
 
 	t.Run("StartStopStress", func(t *testing.T) {
@@ -164,7 +171,7 @@ func TestJobScheduler(t *testing.T) {
 			rivertype.JobStateRunning,
 			rivertype.JobStateScheduled,
 		}
-		uniqueMap := dbunique.UniqueStatesToBitmask(uniqueStates)
+		uniqueMap := uniquestates.UniqueStatesToBitmask(uniqueStates)
 
 		retryableJob1 := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{UniqueKey: []byte("1"), UniqueStates: uniqueMap, State: ptrutil.Ptr(rivertype.JobStateRetryable), ScheduledAt: ptrutil.Ptr(now.Add(-1 * time.Hour))})
 		retryableJob2 := testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{UniqueKey: []byte("2"), UniqueStates: uniqueMap, State: ptrutil.Ptr(rivertype.JobStateRetryable), ScheduledAt: ptrutil.Ptr(now.Add(-5 * time.Second))})
@@ -198,13 +205,13 @@ func TestJobScheduler(t *testing.T) {
 		t.Parallel()
 
 		scheduler, bundle := setupTx(t)
-		scheduler.config.Limit = 10 // reduced size for test speed
+		scheduler.config.Default = 10 // reduced size for test speed
 
 		now := time.Now().UTC()
 
 		// Add one to our chosen batch size to get one extra job and therefore
 		// one extra batch, ensuring that we've tested working multiple.
-		numJobs := scheduler.config.Limit + 1
+		numJobs := scheduler.config.Default + 1
 
 		jobs := make([]*rivertype.JobRow, numJobs)
 
@@ -304,12 +311,15 @@ func TestJobScheduler(t *testing.T) {
 	t.Run("TriggersNotificationsOnEachQueueWithNewlyAvailableJobs", func(t *testing.T) {
 		t.Parallel()
 
-		dbPool := riverinternaltest.TestDB(ctx, t)
-		driver := riverpgxv5.New(dbPool)
-		exec := driver.GetExecutor()
+		var (
+			dbPool = riversharedtest.DBPool(ctx, t)
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+			exec   = driver.GetExecutor()
+		)
 		notifyCh := make(chan []string, 10)
 
-		scheduler, _ := setup(t, exec)
+		scheduler, _ := setup(t, &testOpts{exec: exec, schema: schema})
 		scheduler.config.Interval = time.Minute // should only trigger once for the initial run
 		scheduler.config.NotifyInsert = func(ctx context.Context, tx riverdriver.ExecutorTx, queues []string) error {
 			notifyCh <- queues
@@ -327,6 +337,7 @@ func TestJobScheduler(t *testing.T) {
 			testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
 				FinalizedAt: finalizedAt,
 				Queue:       &queue,
+				Schema:      schema,
 				State:       &state,
 				ScheduledAt: ptrutil.Ptr(now.Add(fromNow)),
 			})
@@ -352,10 +363,80 @@ func TestJobScheduler(t *testing.T) {
 		require.NoError(t, scheduler.Start(ctx))
 		scheduler.TestSignals.ScheduledBatch.WaitOrTimeout()
 
-		expectedQueues := []string{"queue1", "queue2", "queue2", "queue3", "queue4"}
-
 		notifiedQueues := riversharedtest.WaitOrTimeout(t, notifyCh)
 		sort.Strings(notifiedQueues)
-		require.Equal(t, expectedQueues, notifiedQueues)
+		require.Equal(t, []string{"queue1", "queue2", "queue2", "queue3", "queue4"}, notifiedQueues)
+	})
+
+	t.Run("ReducedBatchSizeBreakerTrips", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _ := setupTx(t)
+
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Nanosecond)
+		defer cancel()
+
+		// Starts at default batch size.
+		require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+
+		for range scheduler.reducedBatchSizeBreaker.Limit() - 1 {
+			_, err := scheduler.runOnce(ctx)
+			require.Error(t, err)
+
+			// Circuit not broken yet so we stay at default batch size.
+			require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+		}
+
+		_, err := scheduler.runOnce(ctx)
+		require.Error(t, err)
+
+		// Circuit now broken. Reduced batch size.
+		require.Equal(t, riversharedmaintenance.BatchSizeReduced, scheduler.batchSize())
+	})
+
+	t.Run("ReducedBatchSizeBreakerResetsOnSuccess", func(t *testing.T) { //nolint:dupl
+		t.Parallel()
+
+		scheduler, _ := setupTx(t)
+
+		{
+			ctx, cancel := context.WithTimeout(ctx, 1*time.Nanosecond)
+			defer cancel()
+
+			// Starts at default batch size.
+			require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+
+			for range scheduler.reducedBatchSizeBreaker.Limit() - 1 {
+				_, err := scheduler.runOnce(ctx)
+				require.Error(t, err)
+
+				// Circuit not broken yet so we stay at default batch size.
+				require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+			}
+		}
+
+		// Context has not been cancelled for this call so it succeeds.
+		_, err := scheduler.runOnce(ctx)
+		require.NoError(t, err)
+
+		require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+
+		// Because of the success above, the circuit breaker resets. N - 1
+		// failures are allowed again before it breaks.
+		{
+			ctx, cancel := context.WithTimeout(ctx, 1*time.Nanosecond)
+			defer cancel()
+
+			// Starts at default batch size.
+			require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+
+			for range scheduler.reducedBatchSizeBreaker.Limit() - 1 {
+				_, err := scheduler.runOnce(ctx)
+				require.Error(t, err)
+
+				// Circuit not broken yet so we stay at default batch size.
+				require.Equal(t, riversharedmaintenance.BatchSizeDefault, scheduler.batchSize())
+			}
+		}
 	})
 }

@@ -7,8 +7,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 )
 
 func TestWork(t *testing.T) {
@@ -23,12 +25,36 @@ func TestWork(t *testing.T) {
 		AddWorker(workers, &noOpWorker{})
 	})
 
-	fn := func(ctx context.Context, job *Job[callbackArgs]) error { return nil }
-	ch := callbackWorker{fn: fn}
+	type JobArgs struct {
+		testutil.JobArgsReflectKind[JobArgs]
+	}
 
-	// function worker
-	AddWorker(workers, &ch)
-	require.Contains(t, workers.workersMap, (callbackArgs{}).Kind())
+	AddWorker(workers, WorkFunc(func(ctx context.Context, job *Job[JobArgs]) error {
+		return nil
+	}))
+	require.Contains(t, workers.workersMap, (JobArgs{}).Kind())
+
+	AddWorker(workers, WorkFunc(func(ctx context.Context, job *Job[withKindAliasesArgs]) error {
+		return nil
+	}))
+	require.Contains(t, workers.workersMap, (withKindAliasesArgs{}).Kind())
+	require.Contains(t, workers.workersMap, (withKindAliasesArgs{}).KindAliases()[0])
+
+	require.PanicsWithError(t, `worker for kind "with_kind_alternate_alternate" is already registered`, func() {
+		AddWorker(workers, WorkFunc(func(ctx context.Context, job *Job[withKindAliasesCollisionArgs]) error {
+			return nil
+		}))
+	})
+
+	type OtherJobArgs struct {
+		testutil.JobArgsReflectKind[OtherJobArgs]
+	}
+
+	var jobArgs OtherJobArgs
+	AddWorkerArgs(workers, jobArgs, WorkFunc(func(ctx context.Context, job *Job[OtherJobArgs]) error {
+		return nil
+	}))
+	require.Contains(t, workers.workersMap, (OtherJobArgs{}).Kind())
 }
 
 type configurableArgs struct {
@@ -46,6 +72,17 @@ type configurableWorker struct {
 
 func (w *configurableWorker) Work(ctx context.Context, job *Job[configurableArgs]) error {
 	return nil
+}
+
+type withKindAliasesArgs struct{}
+
+func (a withKindAliasesArgs) Kind() string          { return "with_kind_alternate" }
+func (a withKindAliasesArgs) KindAliases() []string { return []string{"with_kind_alternate_alternate"} }
+
+type withKindAliasesCollisionArgs struct{}
+
+func (a withKindAliasesCollisionArgs) Kind() string {
+	return (withKindAliasesArgs{}).KindAliases()[0]
 }
 
 func TestWorkers_add(t *testing.T) {
@@ -87,9 +124,14 @@ func TestWorkFunc(t *testing.T) {
 	setup := func(t *testing.T) (*Client[pgx.Tx], *testBundle) {
 		t.Helper()
 
-		dbPool := riverinternaltest.TestDB(ctx, t)
+		var (
+			dbPool = riversharedtest.DBPool(ctx, t)
+			driver = riverpgxv5.New(dbPool)
+			schema = riverdbtest.TestSchema(ctx, t, driver, nil)
+			config = newTestConfig(t, schema)
+			client = newTestClient(t, dbPool, config)
+		)
 
-		client := newTestClient(t, dbPool, newTestConfig(t, nil))
 		startClient(ctx, t, client)
 
 		return client, &testBundle{}
@@ -135,7 +177,7 @@ func TestWorkFunc(t *testing.T) {
 		client, _ := setup(t)
 
 		type InFuncWorkFuncArgs struct {
-			JobArgsReflectKind[InFuncWorkFuncArgs]
+			testutil.JobArgsReflectKind[InFuncWorkFuncArgs]
 		}
 
 		workChan := make(chan struct{})

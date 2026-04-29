@@ -4,14 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/util/slogutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 )
 
 // Account represents a minimal account including recent expenditures and a
@@ -64,26 +67,22 @@ func (w *ReconcileAccountWorker) Work(ctx context.Context, job *river.Job[Reconc
 func Example_uniqueJob() {
 	ctx := context.Background()
 
-	dbPool, err := pgxpool.NewWithConfig(ctx, riverinternaltest.DatabaseConfig("river_test_example"))
+	dbPool, err := pgxpool.New(ctx, riversharedtest.TestDatabaseURL())
 	if err != nil {
 		panic(err)
 	}
 	defer dbPool.Close()
 
-	// Required for the purpose of this test, but not necessary in real usage.
-	if err := riverinternaltest.TruncateRiverTables(ctx, dbPool); err != nil {
-		panic(err)
-	}
-
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &ReconcileAccountWorker{})
 
 	riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
-		Logger: slog.New(&slogutil.SlogMessageOnlyHandler{Level: slog.LevelWarn}),
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn, ReplaceAttr: slogutil.NoLevelTime})),
 		Queues: map[string]river.QueueConfig{
 			river.QueueDefault: {MaxWorkers: 100},
 		},
-		TestOnly: true, // suitable only for use in tests; remove for live environments
+		Schema:   riverdbtest.TestSchema(ctx, testutil.PanicTB(), riverpgxv5.New(dbPool), nil), // only necessary for the example test
+		TestOnly: true,                                                                         // suitable only for use in tests; remove for live environments
 		Workers:  workers,
 	})
 	if err != nil {
@@ -114,7 +113,8 @@ func Example_uniqueJob() {
 
 	// Cheat a little by waiting for the first job to come back so we can
 	// guarantee that this example's output comes out in order.
-	waitForNJobs(subscribeChan, 1)
+	// Wait for jobs to complete. Only needed for purposes of the example test.
+	riversharedtest.WaitOrTimeoutN(testutil.PanicTB(), subscribeChan, 1)
 
 	// Because the job is unique ByArgs, another job for account 2 is allowed.
 	_, err = riverClient.Insert(ctx, ReconcileAccountArgs{AccountID: 2}, nil)
@@ -122,7 +122,8 @@ func Example_uniqueJob() {
 		panic(err)
 	}
 
-	waitForNJobs(subscribeChan, 1)
+	// Wait for jobs to complete. Only needed for purposes of the example test.
+	riversharedtest.WaitOrTimeoutN(testutil.PanicTB(), subscribeChan, 1)
 
 	if err := riverClient.Stop(ctx); err != nil {
 		panic(err)

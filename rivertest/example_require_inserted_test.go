@@ -4,14 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/internal/riverinternaltest"
+	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/util/slogutil"
+	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivertest"
 )
 
@@ -32,23 +35,25 @@ func (w *RequiredWorker) Work(ctx context.Context, job *river.Job[RequiredArgs])
 func Example_requireInserted() {
 	ctx := context.Background()
 
-	dbPool, err := pgxpool.NewWithConfig(ctx, riverinternaltest.DatabaseConfig("river_test_example"))
+	dbPool, err := pgxpool.New(ctx, riversharedtest.TestDatabaseURL())
 	if err != nil {
 		panic(err)
 	}
 	defer dbPool.Close()
 
-	// Required for the purpose of this test, but not necessary in real usage.
-	if err := riverinternaltest.TruncateRiverTables(ctx, dbPool); err != nil {
-		panic(err)
-	}
-
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &RequiredWorker{})
 
+	var (
+		schema     = riverdbtest.TestSchema(ctx, testutil.PanicTB(), riverpgxv5.New(dbPool), nil)
+		schemaOpts = &rivertest.RequireInsertedOpts{Schema: schema}
+	)
+
 	riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
-		Logger:  slog.New(&slogutil.SlogMessageOnlyHandler{Level: slog.LevelWarn}),
-		Workers: workers,
+		Logger:   slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn, ReplaceAttr: slogutil.NoLevelTime})),
+		Schema:   schema, // only necessary for the example test
+		TestOnly: true,   // suitable only for use in tests; remove for live environments
+		Workers:  workers,
 	})
 	if err != nil {
 		panic(err)
@@ -71,7 +76,7 @@ func Example_requireInserted() {
 	// *testing.T that comes from a test's argument.
 	t := &testing.T{}
 
-	job := rivertest.RequireInsertedTx[*riverpgxv5.Driver](ctx, t, tx, &RequiredArgs{}, nil)
+	job := rivertest.RequireInsertedTx[*riverpgxv5.Driver](ctx, t, tx, &RequiredArgs{}, schemaOpts)
 	fmt.Printf("Test passed with message: %s\n", job.Args.Message)
 
 	// Verify the same job again, and this time that it was inserted at the
@@ -79,6 +84,7 @@ func Example_requireInserted() {
 	_ = rivertest.RequireInsertedTx[*riverpgxv5.Driver](ctx, t, tx, &RequiredArgs{}, &rivertest.RequireInsertedOpts{
 		Priority: 1,
 		Queue:    river.QueueDefault,
+		Schema:   schema,
 	})
 
 	// Insert and verify one on a pool instead of transaction.
@@ -86,7 +92,7 @@ func Example_requireInserted() {
 	if err != nil {
 		panic(err)
 	}
-	_ = rivertest.RequireInserted(ctx, t, riverpgxv5.New(dbPool), &RequiredArgs{}, nil)
+	_ = rivertest.RequireInserted(ctx, t, riverpgxv5.New(dbPool), &RequiredArgs{}, schemaOpts)
 
 	// Output:
 	// Test passed with message: Hello.

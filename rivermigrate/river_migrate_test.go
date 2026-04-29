@@ -2,7 +2,6 @@ package rivermigrate
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -11,31 +10,26 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 
-	"github.com/riverqueue/river/internal/riverinternaltest"
-	"github.com/riverqueue/river/internal/util/dbutil"
 	"github.com/riverqueue/river/riverdriver"
-	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/sqlctemplate"
+	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 )
 
 const (
 	// The name of an actual migration line embedded in our test data below.
-	migrationLineAlternate                = "alternate"
-	migrationLineAlternateMaxVersion      = 6
-	migrationLineCommitRequired           = "commit_required"
-	migrationLineCommitRequiredMaxVersion = 3
+	migrationLineAlternate           = "alternate"
+	migrationLineAlternateMaxVersion = 6
+	migrationLineCommitRequired      = "commit_required"
 )
 
 //go:embed migration/*/*.sql
@@ -89,7 +83,7 @@ func TestMigrator(t *testing.T) {
 		//
 		// To make this easier to clean up afterward, we create a new, clean schema
 		// for each test run and then drop it afterward.
-		dbPool := riverinternaltest.TestDB(ctx, t)
+		dbPool := riversharedtest.DBPool(ctx, t)
 		schema := "river_migrate_test_" + randutil.Hex(8)
 		_, err := dbPool.Exec(ctx, "CREATE SCHEMA "+schema)
 		require.NoError(t, err)
@@ -108,34 +102,12 @@ func TestMigrator(t *testing.T) {
 
 		migrator, err := New(bundle.driver, &Config{
 			Logger: bundle.logger,
-			schema: schema,
+			Schema: schema,
 		})
 		require.NoError(t, err)
 		migrator.migrations = migrationsBundle.WithTestVersionsMap
 
 		return migrator, bundle
-	}
-
-	// Gets a migrator using the driver for `database/sql`.
-	setupDatabaseSQLMigrator := func(t *testing.T, bundle *testBundle) (*Migrator[*sql.Tx], *sql.Tx) {
-		t.Helper()
-
-		stdPool := stdlib.OpenDBFromPool(bundle.dbPool)
-		t.Cleanup(func() { require.NoError(t, stdPool.Close()) })
-
-		tx, err := stdPool.BeginTx(ctx, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, tx.Rollback()) })
-
-		driver := riverdatabasesql.New(stdPool)
-		migrator, err := New(driver, &Config{
-			Logger: bundle.logger,
-			schema: bundle.schema,
-		})
-		require.NoError(t, err)
-		migrator.migrations = migrationsBundle.WithTestVersionsMap
-
-		return migrator, tx
 	}
 
 	t.Run("NewUnknownLine", func(t *testing.T) {
@@ -337,28 +309,6 @@ func TestMigrator(t *testing.T) {
 			sliceutil.Map(migrations, driverMigrationToInt))
 	})
 
-	t.Run("MigrateDownWithDatabaseSQLDriver", func(t *testing.T) {
-		t.Parallel()
-
-		_, bundle := setup(t)
-		migrator, tx := setupDatabaseSQLMigrator(t, bundle)
-
-		_, err := migrator.Migrate(ctx, DirectionUp, &MigrateOpts{MaxSteps: migrationsBundle.MaxVersion})
-		require.NoError(t, err)
-
-		res, err := migrator.Migrate(ctx, DirectionDown, &MigrateOpts{MaxSteps: 1})
-		require.NoError(t, err)
-		spew.Dump(res.Versions)
-		require.Equal(t, []int{migrationsBundle.MaxVersion}, sliceutil.Map(res.Versions, migrateVersionToInt))
-
-		migrations, err := migrator.driver.UnwrapExecutor(tx).MigrationGetAllAssumingMain(ctx, &riverdriver.MigrationGetAllAssumingMainParams{
-			Schema: bundle.schema,
-		})
-		require.NoError(t, err)
-		require.Equal(t, seqOneTo(migrationsBundle.MaxVersion-1),
-			sliceutil.Map(migrations, driverMigrationToInt))
-	})
-
 	t.Run("MigrateDownWithTargetVersion", func(t *testing.T) {
 		t.Parallel()
 
@@ -440,6 +390,43 @@ func TestMigrator(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, seqOneTo(migrationsBundle.WithTestVersionsMaxVersion),
 			sliceutil.Map(migrations, driverMigrationToInt))
+	})
+
+	// Can't use riverdbtest inthis package due to a circular dependency problem.
+	testTx := func(t *testing.T, driver *driverWithAlternateLine) pgx.Tx {
+		t.Helper()
+
+		execTx, err := driver.GetExecutor().Begin(ctx)
+		require.NoError(t, err)
+
+		t.Cleanup(func() { require.NoError(t, execTx.Rollback(ctx)) })
+
+		return driver.UnwrapTx(execTx)
+	}
+
+	t.Run("MigrateDownTx", func(t *testing.T) {
+		t.Parallel()
+
+		// Some transactional incompatibilities were introduced into the
+		// migration lines so we can no longer exercise the *Tx functions all
+		// the way up and down right now. Only do a couple steps to give them a
+		// little exercise and in such a away that they're functional.
+		// still work
+		const maxSteps = 2
+
+		migrator, bundle := setup(t)
+
+		tx := testTx(t, bundle.driver)
+
+		_, err := migrator.MigrateTx(ctx, tx, DirectionUp, &MigrateOpts{
+			MaxSteps: maxSteps,
+		})
+		require.NoError(t, err)
+
+		_, err = migrator.MigrateTx(ctx, tx, DirectionDown, &MigrateOpts{
+			MaxSteps: maxSteps,
+		})
+		require.NoError(t, err)
 	})
 
 	t.Run("GetVersion", func(t *testing.T) {
@@ -566,28 +553,6 @@ func TestMigrator(t *testing.T) {
 			sliceutil.Map(migrations, driverMigrationToInt))
 	})
 
-	t.Run("MigrateUpWithDatabaseSQLDriver", func(t *testing.T) {
-		t.Parallel()
-
-		_, bundle := setup(t)
-		migrator, tx := setupDatabaseSQLMigrator(t, bundle)
-
-		_, err := migrator.Migrate(ctx, DirectionUp, &MigrateOpts{MaxSteps: migrationsBundle.MaxVersion})
-		require.NoError(t, err)
-
-		res, err := migrator.Migrate(ctx, DirectionUp, &MigrateOpts{MaxSteps: 1})
-		require.NoError(t, err)
-		require.Equal(t, []int{migrationsBundle.MaxVersion + 1}, sliceutil.Map(res.Versions, migrateVersionToInt))
-
-		migrations, err := migrator.driver.UnwrapExecutor(tx).MigrationGetByLine(ctx, &riverdriver.MigrationGetByLineParams{
-			Line:   riverdriver.MigrationLineMain,
-			Schema: bundle.schema,
-		})
-		require.NoError(t, err)
-		require.Equal(t, seqOneTo(migrationsBundle.MaxVersion+1),
-			sliceutil.Map(migrations, driverMigrationToInt))
-	})
-
 	t.Run("MigrateUpWithTargetVersion", func(t *testing.T) {
 		t.Parallel()
 
@@ -651,6 +616,26 @@ func TestMigrator(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, seqOneTo(migrationsBundle.MaxVersion),
 			sliceutil.Map(migrations, driverMigrationToInt))
+	})
+
+	t.Run("MigrateUpTx", func(t *testing.T) {
+		t.Parallel()
+
+		// Some transactional incompatibilities were introduced into the
+		// migration lines so we can no longer exercise the *Tx functions all
+		// the way up and down right now. Only do a couple steps to give them a
+		// little exercise and in such a away that they're functional.
+		// still work
+		const maxSteps = 2
+
+		migrator, bundle := setup(t)
+
+		tx := testTx(t, bundle.driver)
+
+		_, err := migrator.MigrateTx(ctx, tx, DirectionUp, &MigrateOpts{
+			MaxSteps: maxSteps,
+		})
+		require.NoError(t, err)
 	})
 
 	t.Run("ValidateSuccess", func(t *testing.T) {
@@ -741,7 +726,7 @@ func TestMigrator(t *testing.T) {
 		alternateMigrator, err := New(bundle.driver, &Config{
 			Line:   migrationLineAlternate,
 			Logger: bundle.logger,
-			schema: bundle.schema,
+			Schema: bundle.schema,
 		})
 		require.NoError(t, err)
 
@@ -785,7 +770,7 @@ func TestMigrator(t *testing.T) {
 		alternateMigrator, err := New(bundle.driver, &Config{
 			Line:   migrationLineAlternate,
 			Logger: bundle.logger,
-			schema: bundle.schema,
+			Schema: bundle.schema,
 		})
 		require.NoError(t, err)
 
@@ -833,12 +818,12 @@ func TestMigrator(t *testing.T) {
 			// `river_migration`. Note that we have to run the version's SQL
 			// directly because using the migrator will try to interact with
 			// `river_migration`, which is no longer present.
-			sql, _ := migrator.replacer.Run(ctx, migrationsBundle.WithTestVersionsMap[5].SQLUp, nil)
+			sql, _ := migrator.replacer.Run(ctx, bundle.driver.ArgPlaceholder(), migrationsBundle.WithTestVersionsMap[5].SQLUp, nil)
 			_, err = bundle.dbPool.Exec(ctx, sql)
 			require.NoError(t, err)
 
 			// And the version 005 down migration to verify the same.
-			sql, _ = migrator.replacer.Run(ctx, migrationsBundle.WithTestVersionsMap[5].SQLDown, nil)
+			sql, _ = migrator.replacer.Run(ctx, bundle.driver.ArgPlaceholder(), migrationsBundle.WithTestVersionsMap[5].SQLDown, nil)
 			_, err = bundle.dbPool.Exec(ctx, sql)
 			require.NoError(t, err)
 		}
@@ -875,7 +860,7 @@ func TestMigrator(t *testing.T) {
 		commitRequiredMigrator, err := New(bundle.driver, &Config{
 			Line:   migrationLineCommitRequired,
 			Logger: bundle.logger,
-			schema: bundle.schema,
+			Schema: bundle.schema,
 		})
 		require.NoError(t, err)
 
@@ -975,8 +960,7 @@ func buildTestMigrationsBundle(t *testing.T) *testMigrationsBundle {
 // continue to use the original transaction.
 func dbExecError(ctx context.Context, exec riverdriver.Executor, sql string) error {
 	return dbutil.WithTx(ctx, exec, func(ctx context.Context, exec riverdriver.ExecutorTx) error {
-		_, err := exec.Exec(ctx, sql)
-		return err
+		return exec.Exec(ctx, sql)
 	})
 }
 

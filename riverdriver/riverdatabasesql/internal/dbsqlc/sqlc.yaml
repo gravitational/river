@@ -9,6 +9,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_leader.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
+      - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     schema:
       - ../../../riverpgxv5/internal/dbsqlc/pg_misc.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_client.sql
@@ -17,6 +18,7 @@ sql:
       - ../../../riverpgxv5/internal/dbsqlc/river_leader.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_migration.sql
       - ../../../riverpgxv5/internal/dbsqlc/river_queue.sql
+      - ../../../riverpgxv5/internal/dbsqlc/schema.sql
     gen:
       go:
         package: "dbsqlc"
@@ -32,11 +34,6 @@ sql:
           ttl: "TTL"
 
         overrides:
-          - db_type: "bytea"
-            go_type:
-              import: "github.com/riverqueue/river/riverdriver/riverdatabasesql/internal/pgtypealias"
-              type: "NullBytea"
-
           # `database/sql` really does not play nicely with json/jsonb. If it's
           # left as `[]byte` or `json.RawMessage`, `database/sql` will try to
           # encode it as binary (with a \x) which Postgres won't accept as
@@ -46,6 +43,15 @@ sql:
           # but Postgres will also accept them as json/jsonb.
           - db_type: "jsonb"
             go_type: "string"
+
+          - db_type: "pg_catalog.bit"
+            go_type: int
+
+          - db_type: "pg_catalog.bit"
+            go_type:
+              type: int
+              pointer: true
+            nullable: true
 
           - db_type: "pg_catalog.interval"
             go_type: "time.Duration"
@@ -57,24 +63,4 @@ sql:
             go_type:
               type: "time.Time"
               pointer: true
-            nullable: true
-
-          # There doesn't appear to be a good type that's suitable for database/sql other
-          # than the ones in pgtype. It's not great to make the database/sql driver take
-          # a dependency on pgx, but the reality is most users will (or should) be using
-          # pgx anyway.
-          #
-          # Unfortunately due to some sqlc limitations, you can't just use the
-          # pgtype package directly (it tries to use the non-v5 import path and
-          # you end up with duplicate pgtype imports). So there's an alias
-          # package that exposes it indirectly.
-          - db_type: "pg_catalog.bit"
-            go_type:
-              import: "github.com/riverqueue/river/riverdriver/riverdatabasesql/internal/pgtypealias"
-              type: "Bits"
-
-          - db_type: "pg_catalog.bit"
-            go_type:
-              import: "github.com/riverqueue/river/riverdriver/riverdatabasesql/internal/pgtypealias"
-              type: "Bits"
             nullable: true

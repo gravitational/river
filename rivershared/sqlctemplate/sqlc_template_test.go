@@ -26,7 +26,7 @@ func TestReplacer(t *testing.T) {
 
 		replacer, _ := setup(t)
 
-		_, _, err := replacer.RunSafely(ctx, `
+		_, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT /* TEMPLATE: schema */river_job;
 		`, nil)
 		require.EqualError(t, err, "sqlctemplate found template(s) in SQL, but no context container; bug?")
@@ -39,7 +39,7 @@ func TestReplacer(t *testing.T) {
 
 		ctx := WithReplacements(ctx, map[string]Replacement{}, nil)
 
-		_, _, err := replacer.RunSafely(ctx, `
+		_, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT 1;
 		`, nil)
 		require.EqualError(t, err, "sqlctemplate found context container but SQL contains no templates; bug?")
@@ -50,7 +50,7 @@ func TestReplacer(t *testing.T) {
 
 		replacer, _ := setup(t)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT 1;
 		`, nil)
 		require.NoError(t, err)
@@ -69,7 +69,7 @@ func TestReplacer(t *testing.T) {
 			"schema": {Value: "test_schema."},
 		}, nil)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			-- name: JobCountByState :one
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job
@@ -95,11 +95,11 @@ func TestReplacer(t *testing.T) {
 			"where_clause":    {Value: "kind = 'no_op'"},
 		}, nil)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			-- name: JobList :many
 			SELECT *
 			FROM river_job
-			WHERE /* TEMPLATE_BEGIN: where_clause */ 1 /* TEMPLATE_END */
+			WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 			ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
 			LIMIT @max::int;
 		`, nil)
@@ -115,6 +115,53 @@ func TestReplacer(t *testing.T) {
 		`, updatedSQL)
 	})
 
+	t.Run("SyntaxMistakes", func(t *testing.T) {
+		t.Parallel()
+
+		replacer, _ := setup(t)
+
+		// Missing colon after "TEMPLATE".
+		{
+			ctx := WithReplacements(ctx, map[string]Replacement{}, nil)
+
+			_, _, err := replacer.RunSafely(ctx, "$", `
+			-- name: JobCountByState :one
+			SELECT count(*)
+			FROM /* TEMPLATE schema */river_job
+			WHERE state = @state;
+		`, nil)
+			require.EqualError(t, err, "sqlctemplate found template-like tag after replacements; probably syntax error or missing end tag: /* TEMPLATE")
+		}
+
+		// Missing "TEMPLATE_END".
+		{
+			ctx := WithReplacements(ctx, map[string]Replacement{}, nil)
+
+			_, _, err := replacer.RunSafely(ctx, "$", `
+			-- name: JobCountByState :one
+			SELECT count(*)
+			FROM /* TEMPLATE_BEGIN: schema */river_job
+			WHERE state = @state;
+		`, nil)
+			require.EqualError(t, err, "sqlctemplate found template-like tag after replacements; probably syntax error or missing end tag: /* TEMPLATE_BEGIN")
+		}
+
+		// Extra whitespace before "TEMPLATE".
+		{
+			ctx := WithReplacements(ctx, map[string]Replacement{
+				"state": {Value: "'available'"},
+			}, nil)
+
+			_, _, err := replacer.RunSafely(ctx, "$", `
+			-- name: JobCountByState :one
+			SELECT count(*)
+			FROM /*   TEMPLATE schema */river_job
+			WHERE state = /* TEMPLATE_BEGIN: state */ 'available' /* TEMPLATE_END */ -- need to have one valid template to get to the right error
+		`, nil)
+			require.EqualError(t, err, "sqlctemplate found template-like tag after replacements; probably syntax error or missing end tag: /*   TEMPLATE")
+		}
+	})
+
 	t.Run("RepeatedTemplate", func(t *testing.T) {
 		t.Parallel()
 
@@ -124,7 +171,7 @@ func TestReplacer(t *testing.T) {
 			"schema": {Value: "test_schema."},
 		}, nil)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job r1
 				INNER JOIN /* TEMPLATE: schema */river_job r2 ON r1.id = r2.id;
@@ -147,7 +194,7 @@ func TestReplacer(t *testing.T) {
 			"schema": {Stable: true, Value: "test_schema."},
 		}, nil)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job;
 		`, nil)
@@ -161,7 +208,7 @@ func TestReplacer(t *testing.T) {
 		require.Len(t, replacer.cache, 1)
 
 		// Invoke again to make sure we get back the same result.
-		updatedSQL, args, err = replacer.RunSafely(ctx, `
+		updatedSQL, args, err = replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job;
 		`, nil)
@@ -183,10 +230,10 @@ func TestReplacer(t *testing.T) {
 			"where_clause": {Value: "kind = 'no_op'"},
 		}, nil)
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job
-			WHERE /* TEMPLATE_BEGIN: where_clause */ 1 /* TEMPLATE_END */;
+			WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */;
 		`, nil)
 		require.NoError(t, err)
 		require.Nil(t, args)
@@ -218,7 +265,7 @@ func TestReplacer(t *testing.T) {
 				"schema": {Stable: true, Value: "test_schema."},
 			}, nil)
 
-			_, _, err := replacer.RunSafely(ctx, sql, nil)
+			_, _, err := replacer.RunSafely(ctx, "$", sql, nil)
 			require.NoError(t, err)
 		}
 		require.Len(t, replacer.cache, 1)
@@ -229,7 +276,7 @@ func TestReplacer(t *testing.T) {
 				"schema": {Stable: true, Value: "other_schema."},
 			}, nil)
 
-			_, _, err := replacer.RunSafely(ctx, sql, nil)
+			_, _, err := replacer.RunSafely(ctx, "$", sql, nil)
 			require.NoError(t, err)
 		}
 		require.Len(t, replacer.cache, 2)
@@ -242,7 +289,7 @@ func TestReplacer(t *testing.T) {
 				"kind": "kind_value",
 			})
 
-			_, _, err := replacer.RunSafely(ctx, sql, nil)
+			_, _, err := replacer.RunSafely(ctx, "$", sql, nil)
 			require.NoError(t, err)
 		}
 		require.Len(t, replacer.cache, 3)
@@ -256,7 +303,7 @@ func TestReplacer(t *testing.T) {
 				"kind": "other_kind_value",
 			})
 
-			_, _, err := replacer.RunSafely(ctx, sql, nil)
+			_, _, err := replacer.RunSafely(ctx, "$", sql, nil)
 			require.NoError(t, err)
 		}
 		require.Len(t, replacer.cache, 3) // unchanged
@@ -270,7 +317,7 @@ func TestReplacer(t *testing.T) {
 				"state": "state_value",
 			})
 
-			_, _, err := replacer.RunSafely(ctx, sql, nil)
+			_, _, err := replacer.RunSafely(ctx, "$", sql, nil)
 			require.NoError(t, err)
 		}
 		require.Len(t, replacer.cache, 4)
@@ -281,7 +328,7 @@ func TestReplacer(t *testing.T) {
 				"schema": {Stable: true, Value: "test_schema."},
 			}, nil)
 
-			_, _, err := replacer.RunSafely(ctx, `
+			_, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT /* TEMPLATE: schema */river_job;
 		`, nil)
 			require.NoError(t, err)
@@ -300,10 +347,10 @@ func TestReplacer(t *testing.T) {
 			"kind": "no_op",
 		})
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM river_job
-			WHERE /* TEMPLATE_BEGIN: where_clause */ 1 /* TEMPLATE_END */;
+			WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */;
 		`, nil)
 		require.NoError(t, err)
 		require.Equal(t, []any{"no_op"}, args)
@@ -325,10 +372,10 @@ func TestReplacer(t *testing.T) {
 			"kind": "no_op",
 		})
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM river_job
-			WHERE /* TEMPLATE_BEGIN: where_clause */ 1 /* TEMPLATE_END */
+			WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 				AND status = $1;
 		`, []any{"succeeded"})
 		require.NoError(t, err)
@@ -359,10 +406,10 @@ func TestReplacer(t *testing.T) {
 			"status": "succeeded",
 		})
 
-		updatedSQL, args, err := replacer.RunSafely(ctx, `
+		updatedSQL, args, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job
-			WHERE /* TEMPLATE_BEGIN: where_clause */ 1 /* TEMPLATE_END */;
+			WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */;
 		`, nil)
 		require.NoError(t, err)
 		require.Equal(t, []any{"no_op", "succeeded"}, args)
@@ -393,16 +440,13 @@ func TestReplacer(t *testing.T) {
 
 		var wg sync.WaitGroup
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for i := range numIterations {
 				ctx := WithReplacements(ctx, map[string]Replacement{
 					"schema": {Value: "test_schema."},
 				}, nil)
 
-				updatedSQL, _, err := replacer.RunSafely(ctx, `
+				updatedSQL, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*) FROM /* TEMPLATE: schema */river_job;
 		`, nil)
 				require.NoError(t, err)
@@ -412,18 +456,15 @@ func TestReplacer(t *testing.T) {
 
 				periodicallyClearCache(i, replacer)
 			}
-		}()
+		})
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for i := range numIterations {
 				ctx := WithReplacements(ctx, map[string]Replacement{
 					"schema": {Stable: true, Value: "test_schema."},
 				}, nil)
 
-				updatedSQL, _, err := replacer.RunSafely(ctx, `
+				updatedSQL, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT distinct(kind) FROM /* TEMPLATE: schema */river_job;
 		`, nil)
 				require.NoError(t, err)
@@ -433,18 +474,15 @@ func TestReplacer(t *testing.T) {
 
 				periodicallyClearCache(i, replacer)
 			}
-		}()
+		})
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for i := range numIterations {
 				ctx := WithReplacements(ctx, map[string]Replacement{
 					"schema": {Stable: true, Value: "test_schema."},
 				}, nil)
 
-				updatedSQL, _, err := replacer.RunSafely(ctx, `
+				updatedSQL, _, err := replacer.RunSafely(ctx, "$", `
 			SELECT count(*) FROM /* TEMPLATE: schema */river_job WHERE status = 'succeeded';
 		`, nil)
 				require.NoError(t, err)
@@ -454,7 +492,7 @@ func TestReplacer(t *testing.T) {
 
 				periodicallyClearCache(i, replacer)
 			}
-		}()
+		})
 
 		wg.Wait()
 	})
@@ -470,7 +508,7 @@ func BenchmarkReplacer(b *testing.B) {
 			"schema": {Stable: stable, Value: "test_schema."},
 		}, nil)
 
-		_, _, err := replacer.RunSafely(ctx, `
+		_, _, err := replacer.RunSafely(ctx, "$", `
 			-- name: JobCountByState :one
 			SELECT count(*)
 			FROM /* TEMPLATE: schema */river_job

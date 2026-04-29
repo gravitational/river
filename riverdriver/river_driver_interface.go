@@ -15,6 +15,7 @@ package riverdriver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"time"
 
@@ -45,6 +46,21 @@ var (
 //
 // API is not stable. DO NOT IMPLEMENT.
 type Driver[TTx any] interface {
+	// ArgPlaceholder is the placeholder character used in query positional
+	// arguments, so "$" for "$1", "$2", "$3", etc. This is a "$" for Postgres
+	// and "?" for SQLite.
+	//
+	// API is not stable. DO NOT USE.
+	ArgPlaceholder() string
+
+	// DatabaseName is the name of the database that the driver targets like
+	// "postgres" or "sqlite". This is used for purposes like a cache key prefix
+	// in riverdbtest so that multiple drivers may share schemas as long as they
+	// target the same database.
+	//
+	// API is not stable. DO NOT USE.
+	DatabaseName() string
+
 	// GetExecutor gets an executor for the driver.
 	//
 	// API is not stable. DO NOT USE.
@@ -53,7 +69,15 @@ type Driver[TTx any] interface {
 	// GetListener gets a listener for purposes of receiving notifications.
 	//
 	// API is not stable. DO NOT USE.
-	GetListener(schema string) Listener
+	GetListener(params *GetListenenerParams) Listener
+
+	// GetMigrationDefaultLines gets default migration lines that should be
+	// applied when using this driver. This is mainly used by riverdbtest to
+	// figure out what migration lines should be available by default for new
+	// test schemas.
+	//
+	// API is not stable. DO NOT USE.
+	GetMigrationDefaultLines() []string
 
 	// GetMigrationFS gets a filesystem containing migrations for the driver.
 	//
@@ -71,10 +95,42 @@ type Driver[TTx any] interface {
 	// API is not stable. DO NOT USE.
 	GetMigrationLines() []string
 
-	// HasPool returns true if the driver is configured with a database pool.
+	// GetMigrationTruncateTables gets the tables that should be truncated
+	// before or after tests for a specific migration line returned by this
+	// driver. Tables to truncate doesn't need to consider intermediary states,
+	// and should return tables for the latest migration version.
 	//
 	// API is not stable. DO NOT USE.
-	HasPool() bool
+	GetMigrationTruncateTables(line string, version int) []string
+
+	// PoolIsSet returns true if the driver is configured with a database pool.
+	//
+	// API is not stable. DO NOT USE.
+	PoolIsSet() bool
+
+	// PoolSet sets a database pool into a driver will a nil pool. This is meant
+	// only for use in testing, and only in specific circumstances where it's
+	// needed. The pool in a driver should generally be treated as immutable
+	// because it's inherited by driver executors, and changing if when active
+	// executors exist will cause problems.
+	//
+	// Most drivers don't implement this function and return ErrNotImplemented.
+	//
+	// Drivers should only set a pool if the previous pool was nil (to help root
+	// out bugs where something unexpected is happening), and panic in case a
+	// pool is set to a driver twice.
+	//
+	// API is not stable. DO NOT USE.
+	PoolSet(dbPool any) error
+
+	// SQLFragmentColumnIn generates an SQL fragment to be included as a
+	// predicate in a `WHERE` query for the existence of a set of values in a
+	// column like `id IN (...)`. The actual implementation depends on support
+	// for specific data types. Postgres uses arrays while SQLite uses a JSON
+	// fragment with `json_each`.
+	//
+	// API is not stable. DO NOT USE.
+	SQLFragmentColumnIn(column string, values any) (string, any, error)
 
 	// SupportsListener gets whether this driver supports a listener. Drivers
 	// that don't support a listener support poll only mode only.
@@ -82,10 +138,33 @@ type Driver[TTx any] interface {
 	// API is not stable. DO NOT USE.
 	SupportsListener() bool
 
+	// SupportsListenNotify indicates whether the underlying database supports
+	// listen/notify. This differs from SupportsListener in that even if a
+	// driver doesn't a support a listener but the database supports the
+	// underlying listen/notify mechanism, it will still broadcast in case there
+	// are other clients/drivers on the database that do support a listener. If
+	// listen/notify can't be supported at all, no broadcast attempt is made.
+	//
+	// API is not stable. DO NOT USE.
+	SupportsListenNotify() bool
+
+	// TimePrecision returns the maximum time resolution supported by the
+	// database. This is used in test assertions when checking round trips on
+	// timestamps.
+	//
+	// API is not stable. DO NOT USE.
+	TimePrecision() time.Duration
+
 	// UnwrapExecutor gets an executor from a driver transaction.
 	//
 	// API is not stable. DO NOT USE.
 	UnwrapExecutor(tx TTx) ExecutorTx
+
+	// UnwrapTx gets a driver transaction from an executor. This is currently
+	// only needed for test transaction helpers.
+	//
+	// API is not stable. DO NOT USE.
+	UnwrapTx(execTx ExecutorTx) TTx
 }
 
 // Executor provides River operations against a database. It may be a database
@@ -103,12 +182,31 @@ type Executor interface {
 	ColumnExists(ctx context.Context, params *ColumnExistsParams) (bool, error)
 
 	// Exec executes raw SQL. Used for migrations.
-	Exec(ctx context.Context, sql string) (struct{}, error)
+	Exec(ctx context.Context, sql string, args ...any) error
+
+	// IndexDropIfExists drops a database index if exists. This abstraction is a
+	// little leaky right now because Postgres runs this `CONCURRENTLY` and
+	// that's not possible in SQLite.
+	//
+	// API is not stable. DO NOT USE.
+	IndexDropIfExists(ctx context.Context, params *IndexDropIfExistsParams) error
+	IndexExists(ctx context.Context, params *IndexExistsParams) (bool, error)
+	IndexesExist(ctx context.Context, params *IndexesExistParams) (map[string]bool, error)
+
+	// IndexReindex reindexes a database index. This abstraction is a little
+	// leaky right now because Postgres runs this `CONCURRENTLY` and that's not
+	// possible in SQLite.
+	//
+	// API is not stable. DO NOT USE.
+	IndexReindex(ctx context.Context, params *IndexReindexParams) error
 
 	JobCancel(ctx context.Context, params *JobCancelParams) (*rivertype.JobRow, error)
+	JobCountByAllStates(ctx context.Context, params *JobCountByAllStatesParams) (map[rivertype.JobState]int, error)
+	JobCountByQueueAndState(ctx context.Context, params *JobCountByQueueAndStateParams) ([]*JobCountByQueueAndStateResult, error)
 	JobCountByState(ctx context.Context, params *JobCountByStateParams) (int, error)
 	JobDelete(ctx context.Context, params *JobDeleteParams) (*rivertype.JobRow, error)
 	JobDeleteBefore(ctx context.Context, params *JobDeleteBeforeParams) (int, error)
+	JobDeleteMany(ctx context.Context, params *JobDeleteManyParams) ([]*rivertype.JobRow, error)
 	JobGetAvailable(ctx context.Context, params *JobGetAvailableParams) ([]*rivertype.JobRow, error)
 	JobGetByID(ctx context.Context, params *JobGetByIDParams) (*rivertype.JobRow, error)
 	JobGetByIDMany(ctx context.Context, params *JobGetByIDManyParams) ([]*rivertype.JobRow, error)
@@ -117,14 +215,17 @@ type Executor interface {
 	JobInsertFastMany(ctx context.Context, params *JobInsertFastManyParams) ([]*JobInsertFastResult, error)
 	JobInsertFastManyNoReturning(ctx context.Context, params *JobInsertFastManyParams) (int, error)
 	JobInsertFull(ctx context.Context, params *JobInsertFullParams) (*rivertype.JobRow, error)
+	JobInsertFullMany(ctx context.Context, jobs *JobInsertFullManyParams) ([]*rivertype.JobRow, error)
+	JobKindList(ctx context.Context, params *JobKindListParams) ([]string, error)
 	JobList(ctx context.Context, params *JobListParams) ([]*rivertype.JobRow, error)
 	JobRescueMany(ctx context.Context, params *JobRescueManyParams) (*struct{}, error)
 	JobRetry(ctx context.Context, params *JobRetryParams) (*rivertype.JobRow, error)
 	JobSchedule(ctx context.Context, params *JobScheduleParams) ([]*JobScheduleResult, error)
 	JobSetStateIfRunningMany(ctx context.Context, params *JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error)
 	JobUpdate(ctx context.Context, params *JobUpdateParams) (*rivertype.JobRow, error)
-	LeaderAttemptElect(ctx context.Context, params *LeaderElectParams) (bool, error)
-	LeaderAttemptReelect(ctx context.Context, params *LeaderElectParams) (bool, error)
+	JobUpdateFull(ctx context.Context, params *JobUpdateFullParams) (*rivertype.JobRow, error)
+	LeaderAttemptElect(ctx context.Context, params *LeaderElectParams) (*Leader, error)
+	LeaderAttemptReelect(ctx context.Context, params *LeaderReelectParams) (*Leader, error)
 	LeaderDeleteExpired(ctx context.Context, params *LeaderDeleteExpiredParams) (int, error)
 	LeaderGetElectedLeader(ctx context.Context, params *LeaderGetElectedLeaderParams) (*Leader, error)
 	LeaderInsert(ctx context.Context, params *LeaderInsertParams) (*Leader, error)
@@ -162,13 +263,20 @@ type Executor interface {
 	QueueDeleteExpired(ctx context.Context, params *QueueDeleteExpiredParams) ([]string, error)
 	QueueGet(ctx context.Context, params *QueueGetParams) (*rivertype.Queue, error)
 	QueueList(ctx context.Context, params *QueueListParams) ([]*rivertype.Queue, error)
+	QueueNameList(ctx context.Context, params *QueueNameListParams) ([]string, error)
 	QueuePause(ctx context.Context, params *QueuePauseParams) error
 	QueueResume(ctx context.Context, params *QueueResumeParams) error
 	QueueUpdate(ctx context.Context, params *QueueUpdateParams) (*rivertype.Queue, error)
+	QueryRow(ctx context.Context, sql string, args ...any) Row
+
+	SchemaCreate(ctx context.Context, params *SchemaCreateParams) error
+	SchemaDrop(ctx context.Context, params *SchemaDropParams) error
+	SchemaGetExpired(ctx context.Context, params *SchemaGetExpiredParams) ([]string, error)
 
 	// TableExists checks whether a table exists for the schema in the current
 	// search schema.
 	TableExists(ctx context.Context, params *TableExistsParams) (bool, error)
+	TableTruncate(ctx context.Context, params *TableTruncateParams) error
 }
 
 // ExecutorTx is an executor which is a transaction. In addition to standard
@@ -189,6 +297,10 @@ type ExecutorTx interface {
 	Rollback(ctx context.Context) error
 }
 
+type GetListenenerParams struct {
+	Schema string
+}
+
 // Listener listens for notifications. In Postgres, this is a database
 // connection where `LISTEN` has been run.
 //
@@ -199,6 +311,7 @@ type Listener interface {
 	Listen(ctx context.Context, topic string) error
 	Ping(ctx context.Context) error
 	Schema() string
+	SetAfterConnectExec(sql string) // should only ever be used in testing
 	Unlisten(ctx context.Context, topic string) error
 	WaitForNotification(ctx context.Context) (*Notification, error)
 }
@@ -214,11 +327,42 @@ type ColumnExistsParams struct {
 	Table  string
 }
 
+type IndexDropIfExistsParams struct {
+	Index  string
+	Schema string
+}
+
+type IndexExistsParams struct {
+	Index  string
+	Schema string
+}
+
+type IndexesExistParams struct {
+	IndexNames []string
+	Schema     string
+}
+
 type JobCancelParams struct {
 	ID                int64
 	CancelAttemptedAt time.Time
 	ControlTopic      string
+	Now               *time.Time
 	Schema            string
+}
+
+type JobCountByAllStatesParams struct {
+	Schema string
+}
+
+type JobCountByQueueAndStateParams struct {
+	QueueNames []string
+	Schema     string
+}
+
+type JobCountByQueueAndStateResult struct {
+	CountAvailable int64
+	CountRunning   int64
+	Queue          string
 }
 
 type JobCountByStateParams struct {
@@ -232,20 +376,34 @@ type JobDeleteParams struct {
 }
 
 type JobDeleteBeforeParams struct {
+	CancelledDoDelete           bool
 	CancelledFinalizedAtHorizon time.Time
+	CompletedDoDelete           bool
 	CompletedFinalizedAtHorizon time.Time
+	DiscardedDoDelete           bool
 	DiscardedFinalizedAtHorizon time.Time
 	Max                         int
+	QueuesExcluded              []string
+	QueuesIncluded              []string
 	Schema                      string
 }
 
+type JobDeleteManyParams struct {
+	Max           int32
+	NamedArgs     map[string]any
+	OrderByClause string
+	Schema        string
+	WhereClause   string
+}
+
 type JobGetAvailableParams struct {
-	ClientID   string
-	Max        int
-	Now        *time.Time
-	ProducerID int64
-	Queue      string
-	Schema     string
+	ClientID       string
+	MaxAttemptedBy int
+	MaxToLock      int
+	Now            *time.Time
+	ProducerID     int64
+	Queue          string
+	Schema         string
 }
 
 type JobGetByIDParams struct {
@@ -270,6 +428,7 @@ type JobGetStuckParams struct {
 }
 
 type JobInsertFastParams struct {
+	ID *int64
 	// Args contains the raw underlying job arguments struct. It has already been
 	// encoded into EncodedArgs, but the original is kept here for to leverage its
 	// struct tags and interfaces, such as for use in unique key generation.
@@ -319,6 +478,19 @@ type JobInsertFullParams struct {
 	UniqueStates byte
 }
 
+type JobInsertFullManyParams struct {
+	Jobs   []*JobInsertFullParams
+	Schema string
+}
+
+type JobKindListParams struct {
+	After   string
+	Exclude []string
+	Match   string
+	Max     int
+	Schema  string
+}
+
 type JobListParams struct {
 	Max           int32
 	NamedArgs     map[string]any
@@ -330,7 +502,7 @@ type JobListParams struct {
 type JobRescueManyParams struct {
 	ID          []int64
 	Error       [][]byte
-	FinalizedAt []time.Time
+	FinalizedAt []*time.Time
 	ScheduledAt []time.Time
 	Schema      string
 	State       []string
@@ -338,12 +510,13 @@ type JobRescueManyParams struct {
 
 type JobRetryParams struct {
 	ID     int64
+	Now    *time.Time
 	Schema string
 }
 
 type JobScheduleParams struct {
 	Max    int
-	Now    time.Time
+	Now    *time.Time
 	Schema string
 }
 
@@ -363,6 +536,8 @@ type JobSetStateIfRunningParams struct {
 	MetadataDoMerge bool
 	MetadataUpdates []byte
 	ScheduledAt     *time.Time
+	Schema          string // added by completer
+	Snoozed         bool
 	State           rivertype.JobState
 }
 
@@ -427,6 +602,7 @@ func JobSetStateSnoozed(id int64, scheduledAt time.Time, attempt int, metadataUp
 		MetadataDoMerge: len(metadataUpdates) > 0,
 		MetadataUpdates: metadataUpdates,
 		ScheduledAt:     &scheduledAt,
+		Snoozed:         true,
 		State:           rivertype.JobStateScheduled,
 	}
 }
@@ -438,6 +614,7 @@ func JobSetStateSnoozedAvailable(id int64, scheduledAt time.Time, attempt int, m
 		MetadataDoMerge: len(metadataUpdates) > 0,
 		MetadataUpdates: metadataUpdates,
 		ScheduledAt:     &scheduledAt,
+		Snoozed:         true,
 		State:           rivertype.JobStateAvailable,
 	}
 }
@@ -452,12 +629,20 @@ type JobSetStateIfRunningManyParams struct {
 	FinalizedAt     []*time.Time
 	MetadataDoMerge []bool
 	MetadataUpdates [][]byte
+	Now             *time.Time
 	ScheduledAt     []*time.Time
 	Schema          string
 	State           []rivertype.JobState
 }
 
 type JobUpdateParams struct {
+	ID              int64
+	MetadataDoMerge bool
+	Metadata        []byte
+	Schema          string
+}
+
+type JobUpdateFullParams struct {
 	ID                  int64
 	AttemptDoUpdate     bool
 	Attempt             int
@@ -469,6 +654,10 @@ type JobUpdateParams struct {
 	Errors              [][]byte
 	FinalizedAtDoUpdate bool
 	FinalizedAt         *time.Time
+	MaxAttemptsDoUpdate bool
+	MaxAttempts         int
+	MetadataDoUpdate    bool
+	Metadata            []byte
 	Schema              string
 	StateDoUpdate       bool
 	State               rivertype.JobState
@@ -488,6 +677,7 @@ type Leader struct {
 }
 
 type LeaderDeleteExpiredParams struct {
+	Now    *time.Time
 	Schema string
 }
 
@@ -499,17 +689,28 @@ type LeaderInsertParams struct {
 	ElectedAt *time.Time
 	ExpiresAt *time.Time
 	LeaderID  string
+	Now       *time.Time
 	Schema    string
 	TTL       time.Duration
 }
 
 type LeaderElectParams struct {
 	LeaderID string
+	Now      *time.Time
 	Schema   string
 	TTL      time.Duration
 }
 
+type LeaderReelectParams struct {
+	ElectedAt time.Time
+	LeaderID  string
+	Now       *time.Time
+	Schema    string
+	TTL       time.Duration
+}
+
 type LeaderResignParams struct {
+	ElectedAt       time.Time
 	LeaderID        string
 	LeadershipTopic string
 	Schema          string
@@ -584,6 +785,7 @@ type ProducerKeepAliveParams struct {
 type QueueCreateOrSetUpdatedAtParams struct {
 	Metadata  []byte
 	Name      string
+	Now       *time.Time
 	PausedAt  *time.Time
 	Schema    string
 	UpdatedAt *time.Time
@@ -601,17 +803,27 @@ type QueueGetParams struct {
 }
 
 type QueueListParams struct {
-	Limit  int
+	Max    int
 	Schema string
+}
+
+type QueueNameListParams struct {
+	After   string
+	Exclude []string
+	Match   string
+	Max     int
+	Schema  string
 }
 
 type QueuePauseParams struct {
 	Name   string
+	Now    *time.Time
 	Schema string
 }
 
 type QueueResumeParams struct {
 	Name   string
+	Now    *time.Time
 	Schema string
 }
 
@@ -622,7 +834,58 @@ type QueueUpdateParams struct {
 	Schema           string
 }
 
+type Row interface {
+	Scan(dest ...any) error
+}
+
+type IndexReindexParams struct {
+	Index  string
+	Schema string
+}
+
+type Schema struct {
+	Name string
+}
+
+type SchemaCreateParams struct {
+	Schema string
+}
+
+type SchemaDropParams struct {
+	Schema string
+}
+
+type SchemaGetExpiredParams struct {
+	BeforeName string
+	Prefix     string
+}
+
 type TableExistsParams struct {
 	Schema string
 	Table  string
+}
+
+type TableTruncateParams struct {
+	Schema string
+	Table  []string
+}
+
+// MigrationLineMainTruncateTables is a shared helper that produces tables to
+// truncate for the main migration line. It's reused across all drivers.
+//
+// API is not stable. DO NOT USE.
+func MigrationLineMainTruncateTables(version int) []string {
+	// 0 value must be handled and should always point to latest migration version
+	switch version {
+	case 1:
+		return nil // don't truncate `river_migrate`
+	case 2, 3:
+		return []string{"river_job", "river_leader"}
+	case 4:
+		return []string{"river_job", "river_leader", "river_queue"}
+	case 0, 5, 6:
+		return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
+	}
+
+	panic(fmt.Sprintf("unrecognized migration version: %d", version))
 }
